@@ -92,6 +92,7 @@ jobs:
           #   pgo: true
           - platform: windows-x86_64
             runner: windows-2022
+          # The MinGW PGO build has no NVIDIA DLSS: that needs an MSVC-ABI compiler (cl or clang-cl).
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
@@ -308,6 +309,8 @@ jobs:
       - name: Configure Windows
         if: matrix.platform == 'windows-x86_64'
         shell: bash
+        # Fritchii build: no LICHII_BUILD_TAG, so the title is "Fritchii vN" and the Fritchii UI is
+        # on (GenerateSCMRev.cmake), and the update checker is off so it can't replace this build.
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=Release
@@ -318,8 +321,7 @@ jobs:
           -DYUZU_ROOM_STANDALONE=OFF
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
-          -DENABLE_UPDATE_CHECKER=ON
-          -DLICHII_BUILD_TAG=build-${{ github.run_number }}
+          -DENABLE_UPDATE_CHECKER=OFF
           -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
           -DUSE_DISCORD_PRESENCE=OFF
           -DENABLE_WERROR=OFF
@@ -370,8 +372,7 @@ jobs:
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_UPDATE_CHECKER=ON \
-            -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
+            -DENABLE_UPDATE_CHECKER=OFF \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DENABLE_WERROR=OFF \
