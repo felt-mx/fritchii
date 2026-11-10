@@ -95,7 +95,8 @@ void BlitScreen::PrepareFrame(const Device& device, Frame* frame,
 
     if (frame->width != layout.width || frame->height != layout.height) {
         WaitIdle(device);
-    } else if (!present_manager.NeedsStorage(frame, true)) {
+    } else if (frame->format == swapchain_view_format &&
+               !present_manager.NeedsStorage(frame, true)) {
         return;
     }
 
@@ -141,6 +142,11 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
     } else if (present_manager.NeedsStorage(frame, storage_required)) {
         present_manager.RecreateFrame(frame, layout.width, layout.height, swapchain_view_format,
                                       window_adapt->GetRenderPass(), true);
+    } else if (frame->format != swapchain_view_format) {
+        // An earlier frame saw the frame format change (HDR output toggled); this one still
+        // has the old format.
+        present_manager.RecreateFrame(frame, layout.width, layout.height, swapchain_view_format,
+                                      window_adapt->GetRenderPass(), storage_required);
     }
 
     const VkExtent2D window_size{

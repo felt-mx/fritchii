@@ -358,6 +358,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkResetQueryPool vkResetQueryPool{};
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
     PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT{};
+    PFN_vkSetHdrMetadataEXT vkSetHdrMetadataEXT{};
     PFN_vkUnmapMemory vkUnmapMemory{};
     PFN_vkUpdateDescriptorSetWithTemplate vkUpdateDescriptorSetWithTemplate{};
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress{};
@@ -1141,6 +1142,13 @@ public:
         return dld->vkWaitForPresentKHR
                    ? dld->vkWaitForPresentKHR(handle, swapchain, present_id, timeout_ns)
                    : VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
+    /// vkSetHdrMetadataEXT; does nothing when the function was not loaded.
+    void SetHdrMetadataEXT(VkSwapchainKHR swapchain, const VkHdrMetadataEXT& metadata) const noexcept {
+        if (dld->vkSetHdrMetadataEXT) {
+            dld->vkSetHdrMetadataEXT(handle, 1, &swapchain, &metadata);
+        }
     }
 
     std::vector<VkPipelineExecutableStatisticKHR> GetPipelineExecutableStatisticsKHR(

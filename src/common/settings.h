@@ -500,6 +500,29 @@ struct Values {
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
 
+    // HDR output (Vulkan): an HDR10 (or scRGB) swapchain when the display offers one; Switch 2
+    // games are then told their display shows HDR with this peak and paper white.
+    SwitchableSetting<bool> hdr_output{linkage, false, "hdr_output", Category::Renderer,
+                                       Specialization::Default, true, true};
+    SwitchableSetting<u32, true> hdr_peak_luminance{linkage,
+                                                    1000,
+                                                    400,
+                                                    10000,
+                                                    "hdr_peak_luminance",
+                                                    Category::Renderer,
+                                                    Specialization::Countable,
+                                                    true,
+                                                    true};
+    SwitchableSetting<u32, true> hdr_paper_white{linkage,
+                                                 203,
+                                                 80,
+                                                 500,
+                                                 "hdr_paper_white",
+                                                 Category::Renderer,
+                                                 Specialization::Countable,
+                                                 true,
+                                                 true};
+
     SwitchableSetting<bool> use_asynchronous_gpu_emulation{linkage, true, "use_asynchronous_gpu_emulation",
                                                            Category::Renderer};
     // *nix platforms may have issues with the borderless windowed fullscreen mode.

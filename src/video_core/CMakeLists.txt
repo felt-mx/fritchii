@@ -133,6 +133,7 @@ add_library(video_core STATIC
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
     nx2_perf.h
+    hdr_output.h
     nx2_download_trace.h
     pending_maps.h
     present.h
@@ -172,6 +173,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/smaa.h
     renderer_vulkan/present/sgsr.cpp
     renderer_vulkan/present/sgsr.h
+    renderer_vulkan/present/hdr_output_pass.cpp
+    renderer_vulkan/present/hdr_output_pass.h
     renderer_vulkan/present/util.cpp
     renderer_vulkan/present/util.h
     renderer_vulkan/present/window_adapt_pass.cpp

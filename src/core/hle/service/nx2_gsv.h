@@ -40,6 +40,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/hdr_output.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/framebuffer_config.h"
@@ -1526,6 +1527,8 @@ struct Nx2NativeObjects {
     std::optional<VideoTrace> last_video_write;
     u32 next_memory{1};
     u32 next_image{1};
+    // vi2 104's last answer: the game was told its display shows HDR, so it presents HDR10.
+    std::atomic<bool> hdr_reported{};
 };
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
@@ -1729,6 +1732,8 @@ public:
         {
             std::scoped_lock lk{m_vsync->mutex};
             m_vsync->events.clear();
+            m_vsync->hdr_status_events.clear();
+            m_vsync->paper_white_events.clear();
         }
         if (m_vsync_timer) {
             system.CoreTiming().UnscheduleEvent(m_vsync_timer);
@@ -2286,6 +2291,21 @@ private:
                      image_id, layout.width, layout.height, shown_size, crop_width, crop_height,
                      Settings::IsDockedMode());
         }
+        // A game told its display shows HDR (vi2 104) presents HDR10, BT.2020 with the PQ
+        // curve, in its RGB10A2 images. EDEN_NX2_HDR_CONTENT=pq|sdr overrides which RGB10A2
+        // images hold it.
+        static const char* const hdr_content = std::getenv("EDEN_NX2_HDR_CONTENT");
+        const bool pq_encoded =
+            image_format == 4 &&
+            (hdr_content != nullptr ? std::strcmp(hdr_content, "pq") == 0
+                                    : m_objects->hdr_reported.load(std::memory_order_relaxed));
+        if (const u32 shown_format = image_format | (pq_encoded ? 1U << 31 : 0U);
+            shown_format != m_shown_format) {
+            m_shown_format = shown_format;
+            LOG_INFO(Service, "nx2:vi2 composite image {} format {} ({}){}", image_id, image_format,
+                     image_format == 4 ? "RGB10A2" : image_format == 1 ? "RGBA8" : "unknown, shown as RGBA8",
+                     pq_encoded ? ", HDR10" : "");
+        }
         std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
             .address = *device,
             .offset = 0,
@@ -2299,6 +2319,7 @@ private:
             .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
+            .pq_encoded = pq_encoded,
         }};
         std::vector<Nvidia::NvFence> fences;
         if (fence_id < 192) {
@@ -2406,21 +2427,27 @@ private:
     }
 
     // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 paper white in nits. The empty reply
-    // left it to the message buffer's leftovers; answer the BT.2408 reference white.
+    // left it to the message buffer's leftovers; answer the hdr_paper_white setting (203, the
+    // BT.2408 reference white, by default).
     void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {203});
+        TipcReplyWords(ctx, {VideoCommon::HdrOutput::CurrentStatus().paper_white});
     }
 
-    // nn::vi2::QueryDisplayHdrStatus(display name): u64 HdrOutputFormat, u16. The sdk's
-    // DefaultDisplay::QueryHdrStatus takes format 1 as HDR output and fails with 0x272 on
-    // anything above 1. With the empty auto stub reply it read the request's leftover words as
-    // the format; Kirby Air Riders re-queries whenever its HDR status event fires and rebuilt its
-    // window images every few frames, which showed black. Report SDR output.
     // nn::vi2::QueryDisplayHdrStatus(display name): u64 output format, u16 peak luminance in
     // nits. The sdk takes format 1 as SDR and 2 as HDR and fails the query on any other value.
-    // Report SDR output with a typical SDR panel's peak.
+    // With the empty auto stub reply it read the request's leftover words as the format; Kirby
+    // Air Riders re-queries whenever its HDR status event fires and rebuilt its window images
+    // every few frames, which showed black. Report HDR only while the host presents HDR
+    // (VideoCommon::HdrOutput), else SDR with a typical SDR panel's peak.
     void QueryDisplayHdrStatus(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {1, 0, 400});
+        const auto status = VideoCommon::HdrOutput::CurrentStatus();
+        if (m_objects->hdr_reported.exchange(status.hdr, std::memory_order_relaxed) != status.hdr ||
+            !m_hdr_status_logged) {
+            m_hdr_status_logged = true;
+            LOG_INFO(Service, "nx2:vi2 104: display HDR status {} (peak {} nits, paper white {})",
+                     status.hdr ? "HDR" : "SDR", status.peak_luminance, status.paper_white);
+        }
+        TipcReplyWords(ctx, {status.hdr ? 2U : 1U, 0, status.peak_luminance});
     }
 
     // 212(u64 layer): u64 bits of the layer's buffer slots that are ready. The client polls it once
@@ -2536,6 +2563,7 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            SetHdrSlot(index, ctx.GetCommand());
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -2547,8 +2575,24 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            SetHdrSlot(index, 0);
         }
         TipcReplyWords(ctx, {});
+    }
+
+    // The HDR status (265) and paper white (267) slots do fire on a change: when HDR output
+    // starts or stops on the host, or the HDR settings change (the vsync timer checks).
+    void SetHdrSlot(u32 index, u32 bind_command) {
+        auto* event = m_native_events[index];
+        std::scoped_lock lk{m_vsync->mutex};
+        for (auto* list : {&m_vsync->hdr_status_events, &m_vsync->paper_white_events}) {
+            std::erase(*list, event);
+        }
+        if (bind_command == 265) {
+            m_vsync->hdr_status_events.push_back(event);
+        } else if (bind_command == 267) {
+            m_vsync->paper_white_events.push_back(event);
+        }
     }
 
     void ReplyNativeEvent(HLERequestContext& ctx, u32 index) {
@@ -2601,6 +2645,24 @@ private:
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
+                    if (const auto status = VideoCommon::HdrOutput::CurrentStatus();
+                        status != vsync_state->hdr_status) {
+                        const auto& old = vsync_state->hdr_status;
+                        const bool hdr_changed = status.hdr != old.hdr ||
+                                                 status.peak_luminance != old.peak_luminance;
+                        const bool paper_white_changed = status.paper_white != old.paper_white;
+                        vsync_state->hdr_status = status;
+                        if (hdr_changed) {
+                            for (auto* event : vsync_state->hdr_status_events) {
+                                event->Signal(kernel);
+                            }
+                        }
+                        if (paper_white_changed) {
+                            for (auto* event : vsync_state->paper_white_events) {
+                                event->Signal(kernel);
+                            }
+                        }
+                    }
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();
                         ++vsync_state->trace_callbacks;
@@ -2645,6 +2707,9 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        std::vector<Kernel::KEvent*> hdr_status_events;  ///< Bound by 265
+        std::vector<Kernel::KEvent*> paper_white_events; ///< Bound by 267
+        VideoCommon::HdrOutput::Status hdr_status{VideoCommon::HdrOutput::CurrentStatus()}; ///< As last signalled
         Common::DkbFrameTrace::RateLimit trace_rate;
         std::optional<s64> trace_last_callback, trace_min_gap;
         s64 trace_max_late{};
@@ -2655,6 +2720,8 @@ private:
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
     u64 m_shown_layout{}; // image and crop size last logged
+    u32 m_shown_format{~0U}; // image format and HDR10 flag last logged
+    bool m_hdr_status_logged{};
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
 
