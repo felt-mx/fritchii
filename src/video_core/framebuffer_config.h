@@ -38,6 +38,8 @@ struct FramebufferConfig {
     Common::Rectangle<int> crop_rect{};
     BlendMode blending{};
     bool native_tiling{};
+    /// BT.2100 PQ (HDR10) colour: a Switch 2 game's RGB10A2 output after vi2 reported HDR.
+    bool pq_encoded{};
     u32 layer_stack_mask{Service::Nvnflinger::DefaultLayerStackMask};
 };
 

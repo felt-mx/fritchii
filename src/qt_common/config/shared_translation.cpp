@@ -234,6 +234,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
     INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
+    INSERT(Settings, hdr_output, tr("HDR output (Vulkan only)"),
+           tr("Presents in HDR10 when the display has HDR turned on in the system settings, and "
+              "tells Switch 2 games their display shows HDR.\nSDR games and menus are shown at "
+              "the paper white brightness."));
+    INSERT(Settings, hdr_peak_luminance, tr("HDR peak brightness:"),
+           tr("The display's peak brightness. Switch 2 games tone map their HDR output to it."));
+    INSERT(Settings, hdr_paper_white, tr("HDR paper white:"),
+           tr("Brightness of SDR content and of the white games use for menus and text."));
+
     // Renderer (Advanced Graphics)
     INSERT(Settings, use_asynchronous_gpu_emulation, QString(), QString());
 

@@ -11,11 +11,13 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/present/hdr_output_pass.h"
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -41,6 +43,8 @@ struct Frame {
     vk::CommandBuffer cmdbuf;
     vk::Semaphore render_ready;
     vk::Fence present_done;
+    VkFormat format{};  ///< Of image and image_view
+    bool pq_content{};  ///< Holds a game's HDR10 (BT.2020 PQ) output rather than SDR colour
     bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
@@ -77,6 +81,10 @@ public:
 
     [[nodiscard]] std::size_t SwapchainImageCount() const { return swapchain_image_count; }
     [[nodiscard]] VkFormat SwapchainImageFormat() const { return swapchain_image_format; }
+    /// Format to render present frames in for the current swapchain.
+    [[nodiscard]] VkFormat FrameFormat() const { return frame_format; }
+    /// Image format of frames in SdrFrameFormat, the only ones frame generation runs on.
+    [[nodiscard]] VkFormat SdrFrameImageFormat() const { return sdr_frame_image_format; }
 
 private:
     void PresentThread(std::stop_token token);
@@ -126,6 +134,9 @@ private:
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};
+    std::atomic<VkFormat> frame_format{};
+    std::atomic<VkFormat> sdr_frame_image_format{}; ///< Image format of SdrFrameFormat frames
+    std::optional<HdrOutputPass> hdr_output;        ///< Present thread only
 
     // Host frame pacer, used when the device supports VK_KHR_present_wait (present thread only).
     struct PendingWait {

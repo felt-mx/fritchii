@@ -15,6 +15,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/hdr_output.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -133,8 +134,11 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , scheduler{scheduler_}
     , swapchain{swapchain_}
     , surface{surface_}
-    , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
-    , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
+    , blit_supported{CanBlitToSwapchain(device.GetPhysical(), SdrFrameFormat)}
+    , storage_supported{CanStoreToFrame(device.GetPhysical(),
+                                        swapchain.GetOutput() == SwapchainOutput::Sdr
+                                            ? swapchain.GetImageFormat()
+                                            : SdrFrameFormat)}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
@@ -167,6 +171,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         frame.storage_capable = storage_supported;
         free_queue.push_back(&frame);
     }
+    hdr_output.emplace(device, frames.size());
 
     present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
@@ -190,6 +195,8 @@ PresentManager::~PresentManager() {
         present_wait_thread.request_stop();
         present_wait_thread.join();
     }
+    // The next renderer may not output HDR (OpenGL, or HDR off): stop reporting it to games.
+    VideoCommon::HdrOutput::g_host_active.store(false, std::memory_order_relaxed);
 }
 
 Frame* PresentManager::GetRenderFrame() {
@@ -235,7 +242,8 @@ size_t PresentManager::MaxExtraFrames() const {
 }
 
 bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
-    return required && frame->storage_capable && !frame->storage_view;
+    return required && frame->storage_capable && !frame->storage_view &&
+           frame->format == SdrFrameFormat;
 }
 
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
@@ -244,8 +252,15 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
 
     frame->width = width;
     frame->height = height;
+    frame->format = image_view_format;
+    // SDR frames keep the SDR swapchain's format (they are blitted to it); HDR frames are
+    // their own format, copied by the HDR output pass.
+    const VkFormat image_format =
+        image_view_format == SdrFrameFormat ? sdr_frame_image_format.load() : image_view_format;
 
-    const bool with_storage = storage && frame->storage_capable;
+    // Frame generation stores rgba8 (storage_supported was checked for the SDR format).
+    const bool with_storage =
+        storage && frame->storage_capable && image_view_format == SdrFrameFormat;
     VkImageUsageFlags storage_usage = 0;
     if (with_storage) {
         storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
@@ -256,7 +271,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        .format = image_format,
         .extent =
             {
                 .width = width,
@@ -307,7 +322,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
             .flags = 0,
             .image = *frame->image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = swapchain.GetImageFormat(),
+            .format = image_format,
             .components =
                 {
                     .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -604,6 +619,12 @@ void PresentManager::SetImageCount() {
 #endif
     swapchain_image_count = swapchain.GetImageCount();
     swapchain_image_format = swapchain.GetImageFormat();
+    const bool hdr = swapchain.GetOutput() != SwapchainOutput::Sdr;
+    sdr_frame_image_format = hdr ? SdrFrameFormat : swapchain.GetImageFormat();
+    frame_format = swapchain.GetImageViewFormat();
+    if (VideoCommon::HdrOutput::g_host_active.exchange(hdr, std::memory_order_relaxed) != hdr) {
+        LOG_INFO(Render_Vulkan, "HDR output {}", hdr ? "active" : "inactive");
+    }
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
@@ -680,6 +701,15 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+
+    // HDR swapchains, HDR frames and frames left over from another swapchain format are drawn
+    // with a colour conversion; plain SDR frames are blitted.
+    swapchain.RefreshHdrMetadata();
+    const bool convert = swapchain.GetOutput() != SwapchainOutput::Sdr || frame->pq_content ||
+                         frame->format != SdrFrameFormat;
+    if (convert) {
+        hdr_output->Draw(device, cmdbuf, *frame, swapchain);
+    }
 
     const VkImage image{swapchain.CurrentImage()};
     const VkExtent2D extent = swapchain.GetExtent();
@@ -760,22 +790,26 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         },
     };
 
-    cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
-                           {}, {}, pre_barriers);
+    if (!convert) {
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, {}, {}, {}, pre_barriers);
 
-    if (blit_supported) {
-        cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
-                         VK_FILTER_LINEAR);
-    } else {
-        cmdbuf.CopyImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
+        if (blit_supported) {
+            cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             MakeImageBlit(frame->width, frame->height, extent.width,
+                                           extent.height),
+                             VK_FILTER_LINEAR);
+        } else {
+            cmdbuf.CopyImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             MakeImageCopy(frame->width, frame->height, extent.width,
+                                           extent.height));
+        }
+
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                               {}, {}, {}, post_barriers);
     }
-
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, {},
-                           {}, {}, post_barriers);
 
     cmdbuf.End();
 
@@ -783,9 +817,14 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     const VkSemaphore render_semaphore = swapchain.CurrentRenderSemaphore();
     const std::array wait_semaphores = {present_semaphore, *frame->render_ready};
 
-    static constexpr std::array<VkPipelineStageFlags, 2> wait_stage_masks{
+    static constexpr std::array<VkPipelineStageFlags, 2> blit_wait_stages{
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
+    };
+    // The swapchain image is written as a colour attachment, the frame sampled.
+    static constexpr std::array<VkPipelineStageFlags, 2> draw_wait_stages{
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
     };
 
     const VkSubmitInfo submit_info{
@@ -793,7 +832,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         .pNext = nullptr,
         .waitSemaphoreCount = 2U,
         .pWaitSemaphores = wait_semaphores.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = convert ? draw_wait_stages.data() : blit_wait_stages.data(),
         .commandBufferCount = 1,
         .pCommandBuffers = cmdbuf.address(),
         .signalSemaphoreCount = 1U,

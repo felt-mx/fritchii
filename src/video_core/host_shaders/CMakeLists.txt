@@ -89,6 +89,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_flash_watch.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_hdr.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp32.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_quad_indexed.comp

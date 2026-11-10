@@ -220,6 +220,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QCheckBox* hdr_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -240,6 +241,11 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::ReverseSlider, true,
                     0.5f, nullptr, tr("%", "FSR/SGSR sharpening percentage (e.g. 50%)"));
+            } else if (setting->Id() == Settings::values.hdr_peak_luminance.Id() ||
+                       setting->Id() == Settings::values.hdr_paper_white.Id()) {
+                return builder.BuildWidget(setting, apply_funcs, nullptr,
+                                           ConfigurationShared::RequestType::SpinBox,
+                                           tr(" nits", "Unit of HDR brightness settings"));
             } else {
                 return builder.BuildWidget(setting, apply_funcs);
             }
@@ -347,6 +353,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
+        } else if (setting->Id() == Settings::values.hdr_output.Id()) {
+            hdr_checkbox = widget->checkbox;
+            hold_graphics.emplace(setting->Id(), widget);
         } else {
             hold_graphics.emplace(setting->Id(), widget);
         }
@@ -367,6 +376,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
                 it->second->setVisible(frame_gen_checkbox->isChecked());
                 connect(frame_gen_checkbox, &QCheckBox::toggled, it->second, &QWidget::setVisible);
+            }
+        }
+    }
+    if (hdr_checkbox != nullptr) {
+        for (const u32 id :
+             {Settings::values.hdr_peak_luminance.Id(), Settings::values.hdr_paper_white.Id()}) {
+            if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
+                it->second->setVisible(hdr_checkbox->isChecked());
+                connect(hdr_checkbox, &QCheckBox::toggled, it->second, &QWidget::setVisible);
             }
         }
     }

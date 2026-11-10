@@ -240,6 +240,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkResetQueryPool);
     X(vkSetDebugUtilsObjectNameEXT);
     X(vkSetDebugUtilsObjectTagEXT);
+    X(vkSetHdrMetadataEXT);
     X(vkUnmapMemory);
     X(vkUpdateDescriptorSetWithTemplate);
     X(vkUpdateDescriptorSets);

@@ -20,6 +20,23 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
+/// What the swapchain images hold. The values are vulkan_present_hdr.frag's target codes.
+enum class SwapchainOutput : u32 {
+    Sdr = 0,   ///< sRGB non-linear colour space
+    Hdr10 = 1, ///< BT.2020 primaries, ST 2084 (PQ) transfer
+    ScRgb = 2, ///< Linear BT.709 primaries, 1.0 = 80 nits, values outside [0, 1] allowed
+};
+
+/// Format of SDR present frames, and of every frame while frame generation runs (its shaders
+/// store rgba8).
+#ifdef __ANDROID__
+inline constexpr VkFormat SdrFrameFormat = VK_FORMAT_R8G8B8A8_UNORM;
+#else
+inline constexpr VkFormat SdrFrameFormat = VK_FORMAT_B8G8R8A8_UNORM;
+#endif
+/// Format of present frames on an HDR swapchain: 10 bits keep a game's PQ output free of banding.
+inline constexpr VkFormat HdrFrameFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+
 class Swapchain {
 public:
     explicit Swapchain(
@@ -55,8 +72,11 @@ public:
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
-        return !swapchain || IsSubOptimal() || NeedsPresentModeUpdate();
+        return !swapchain || IsSubOptimal() || NeedsPresentModeUpdate() || NeedsOutputUpdate();
     }
+
+    /// Re-sends the HDR10 metadata when the HDR luminance settings changed.
+    void RefreshHdrMetadata();
 
     bool IsCreated() const {
         return static_cast<bool>(swapchain);
@@ -96,12 +116,22 @@ public:
         return images[image_index];
     }
 
+    /// Format of the present frames copied to this swapchain (SdrFrameFormat or HdrFrameFormat).
     VkFormat GetImageViewFormat() const {
         return image_view_format;
     }
 
     VkFormat GetImageFormat() const {
         return surface_format.format;
+    }
+
+    SwapchainOutput GetOutput() const {
+        return output;
+    }
+
+    /// Changes with every swapchain this object creates.
+    u64 GetGeneration() const {
+        return generation;
     }
 
     VkSemaphore CurrentPresentSemaphore() const {
@@ -133,6 +163,9 @@ private:
 
     bool NeedsPresentModeUpdate() const;
 
+    /// The HDR output or frame generation setting changed since the swapchain was created.
+    bool NeedsOutputUpdate() const;
+
     VkSurfaceKHR_T* surface;
 
     const Device& device;
@@ -157,6 +190,13 @@ private:
     VkExtent2D extent{};
     VkPresentModeKHR present_mode{};
     VkSurfaceFormatKHR surface_format{};
+    SwapchainOutput output{SwapchainOutput::Sdr};
+    bool hdr_requested{};       ///< hdr_output when the swapchain was created
+    bool frame_gen_requested{}; ///< Frame generation when the swapchain was created
+    bool hdr_unavailable_logged{};
+    u64 generation{};
+    u32 metadata_peak{};        ///< Luminance last sent with vkSetHdrMetadataEXT
+    u32 metadata_paper_white{};
     bool has_imm{false};
     bool has_mailbox{false};
     bool has_fifo_relaxed{false};

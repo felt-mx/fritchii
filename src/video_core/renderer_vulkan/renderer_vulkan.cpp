@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -109,6 +111,49 @@ std::string GetDriverVersion(const Device& device) {
 std::string BuildCommaSeparatedExtensions(
     const std::set<std::string, std::less<>>& available_extensions) {
     return fmt::format("{}", fmt::join(available_extensions, ","));
+}
+
+/// A screenshot of a game's HDR10 output holds PQ values: tone map them to SDR the way
+/// vulkan_present_hdr.frag does for an SDR swapchain, so the saved image isn't washed out.
+void ToneMapPqScreenshot(std::span<u8> bgra, f32 paper_white) {
+    constexpr f32 m1 = 0.1593017578125f, m2 = 78.84375f;
+    constexpr f32 c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    std::array<f32, 256> pq_to_relative{}; // Linear light, 1.0 = paper white
+    for (size_t i = 0; i < pq_to_relative.size(); ++i) {
+        const f32 p = std::pow(static_cast<f32>(i) / 255.0f, 1.0f / m2);
+        pq_to_relative[i] =
+            10000.0f * std::pow((std::max)(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1) / paper_white;
+    }
+    std::array<u8, 1024> encode{}; // Gamma 2.2 of [0, 1]
+    for (size_t i = 0; i < encode.size(); ++i) {
+        const f32 x = static_cast<f32>(i) / static_cast<f32>(encode.size() - 1);
+        encode[i] = static_cast<u8>(std::pow(x, 1.0f / 2.2f) * 255.0f + 0.5f);
+    }
+    for (size_t i = 0; i + 3 < bgra.size(); i += 4) {
+        const f32 r = pq_to_relative[bgra[i + 2]];
+        const f32 g = pq_to_relative[bgra[i + 1]];
+        const f32 b = pq_to_relative[bgra[i]];
+        // BT.2020 to BT.709.
+        std::array<f32, 3> rgb{
+            (std::max)(1.6604910f * r - 0.5876411f * g - 0.0728499f * b, 0.0f),
+            (std::max)(-0.1245505f * r + 1.1328999f * g - 0.0083494f * b, 0.0f),
+            (std::max)(-0.0181508f * r - 0.1005789f * g + 1.1187297f * b, 0.0f),
+        };
+        constexpr f32 knee = 0.8f;
+        if (const f32 m = (std::max)({rgb[0], rgb[1], rgb[2]}); m > knee) {
+            const f32 t = (m - knee) / (1.0f - knee);
+            const f32 scale = (knee + (1.0f - knee) * t / (1.0f + t)) / m;
+            for (f32& c : rgb) {
+                c *= scale;
+            }
+        }
+        const auto to_byte = [&](f32 c) {
+            return encode[static_cast<size_t>((std::min)(c, 1.0f) * (encode.size() - 1) + 0.5f)];
+        };
+        bgra[i + 2] = to_byte(rgb[0]);
+        bgra[i + 1] = to_byte(rgb[1]);
+        bgra[i] = to_byte(rgb[2]);
+    }
 }
 
 } // Anonymous namespace
@@ -229,21 +274,25 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
+    frame->pq_content =
+        std::ranges::any_of(framebuffers, &Tegra::FramebufferConfig::pq_encoded);
+
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                                render_window.GetFramebufferLayout(),
                                present_manager.SwapchainImageCount(),
-                               swapchain.GetImageViewFormat());
+                               present_manager.FrameFormat());
 
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
 
-    frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
+    frame_gen.Process(device, frame, present_manager.SdrFrameImageFormat(),
                       GuestExtent(framebuffers));
 
     const size_t generated_frames = frame_gen.GeneratedFrameCount();
     for (size_t generation = 0; generation < generated_frames; ++generation) {
         Frame* generated = present_manager.GetRenderFrame();
+        generated->pq_content = frame->pq_content;
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
         generated->render_tick = scheduler.Flush(*generated->render_ready);
@@ -361,6 +410,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
     std::memcpy(renderer_settings.screenshot_bits, dst_buffer.Mapped().data(),
                 dst_buffer.Mapped().size());
+    if (std::ranges::any_of(screenshot_layers, &Tegra::FramebufferConfig::pq_encoded)) {
+        ToneMapPqScreenshot(
+            {static_cast<u8*>(renderer_settings.screenshot_bits), dst_buffer.Mapped().size()},
+            static_cast<f32>(Settings::values.hdr_paper_white.GetValue()));
+    }
     renderer_settings.screenshot_complete_callback(false);
     renderer_settings.screenshot_requested = false;
 }
