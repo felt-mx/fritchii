@@ -492,7 +492,7 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
-    target_link_libraries(video_core PRIVATE advapi32)
+    target_link_libraries(video_core PRIVATE advapi32 dwmapi)
 endif()
 
 # Shader warm-up builder: game archives use zstd (also with dictionaries) and zlib.
@@ -531,10 +531,12 @@ if (ENABLE_NSIGHT_AFTERMATH)
 endif()
 
 if (MSVC)
-    target_compile_options(video_core PRIVATE
-        /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
-        /we4244 # 'conversion': conversion from 'type1' to 'type2', possible loss of data
-    )
+    if (ENABLE_WERROR)
+        target_compile_options(video_core PRIVATE
+            /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
+            /we4244 # 'conversion': conversion from 'type1' to 'type2', possible loss of data
+        )
+    endif()
 else()
     if (APPLE)
         # error: declaration shadows a typedef in 'interval_base_set<SubType, DomainT, Compare, Interval, Alloc>'
