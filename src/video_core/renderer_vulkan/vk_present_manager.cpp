@@ -5,7 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
+#include <utility>
 
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
@@ -26,6 +29,9 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -283,6 +289,10 @@ void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             frame->queued_at = std::chrono::steady_clock::now();
+#ifdef EGLANTINE_STREAMLINE
+            // Right after this frame's commands on the worker: its DLSS evaluation's token.
+            frame->frame_gen_token = Streamline::TakeFrameGenToken();
+#endif
             // What ends the present thread's "present: wait for frame" (on the Vulkan worker).
             if (Common::Nx2Timeline::Active()) {
                 Common::Nx2Timeline::Instant("present: frame queued", {"frame", frame->index});
@@ -293,6 +303,9 @@ void PresentManager::Present(Frame* frame) {
         });
     } else {
         scheduler.WaitWorker();
+#ifdef EGLANTINE_STREAMLINE
+        frame->frame_gen_token = Streamline::TakeFrameGenToken();
+#endif
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -755,6 +768,108 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
     DiscardFrame(frame);
 }
 
+void PresentManager::TagGenericFrameGen(Frame* frame, vk::CommandBuffer cmdbuf) {
+#ifdef EGLANTINE_STREAMLINE
+    constexpr VkFormat DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
+    constexpr VkFormat MOTION_FORMAT = VK_FORMAT_R16G16_SFLOAT;
+    const u32 width = frame->game_right > frame->game_left ? frame->game_right - frame->game_left
+                                                           : swapchain.GetExtent().width;
+    const u32 height = frame->game_bottom > frame->game_top ? frame->game_bottom - frame->game_top
+                                                            : swapchain.GetExtent().height;
+    if (width < 64 || height < 64) {
+        return;
+    }
+    if (!fg_generic_depth || fg_generic_extent.width != width ||
+        fg_generic_extent.height != height) {
+        if (fg_generic_depth) {
+            // Frame generation may still read the old ones on its own queues.
+            device.GetLogical().WaitIdle();
+        }
+        const auto create = [&](VkFormat format, VkImageAspectFlags aspect, vk::Image& image,
+                                vk::ImageView& view) {
+            image = memory_allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = format,
+                .extent = {width, height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+            view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .image = *image,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = format,
+                .components{},
+                .subresourceRange{aspect, 0, 1, 0, 1},
+            });
+        };
+        create(DEPTH_FORMAT, VK_IMAGE_ASPECT_DEPTH_BIT, fg_generic_depth, fg_generic_depth_view);
+        create(MOTION_FORMAT, VK_IMAGE_ASPECT_COLOR_BIT, fg_generic_motion,
+               fg_generic_motion_view);
+        fg_generic_extent = {width, height};
+        const auto barrier = [](VkImage image, VkImageAspectFlags aspect, VkAccessFlags src,
+                                VkAccessFlags dst, VkImageLayout from, VkImageLayout to) {
+            return VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = src,
+                .dstAccessMask = dst,
+                .oldLayout = from,
+                .newLayout = to,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange{aspect, 0, 1, 0, 1},
+            };
+        };
+        constexpr VkImageLayout DST = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        constexpr VkImageLayout READ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const std::array to_clear{
+            barrier(*fg_generic_depth, VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, DST),
+            barrier(*fg_generic_motion, VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, DST),
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, {}, {}, to_clear);
+        // Reversed depth: 0 is the far plane. Zero motion: DLSS-G's optical flow does the rest.
+        const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        const VkImageSubresourceRange color_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const VkClearDepthStencilValue far_depth{0.0f, 0};
+        const VkClearColorValue zero{};
+        cmdbuf.ClearDepthStencilImage(*fg_generic_depth, DST,
+                                      far_depth, depth_range);
+        cmdbuf.ClearColorImage(*fg_generic_motion, DST, zero, color_range);
+        const std::array to_read{
+            barrier(*fg_generic_depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT, DST, READ),
+            barrier(*fg_generic_motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT, DST, READ),
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, to_read);
+        LOG_INFO(Render_Vulkan,
+                 "DLSS Frame Generation without the game's motion: optical flow only at {}x{}",
+                 width, height);
+    }
+    frame->frame_gen_token = Streamline::GenericFrameGenToken(
+        *fg_generic_depth, *fg_generic_depth_view, DEPTH_FORMAT, *fg_generic_motion,
+        *fg_generic_motion_view, MOTION_FORMAT, width, height, *cmdbuf);
+#endif
+}
+
 void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // If the size of the incoming frames has changed, recreate the swapchain
@@ -770,9 +885,29 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         return;
     }
 
+#ifdef EGLANTINE_STREAMLINE
+    const auto acquire_begin = std::chrono::steady_clock::now();
+    // DLSS Frame Generation's pacer takes one present at a time and waits on the GPU for it:
+    // presented before the GPU had rendered it, each present waited a whole GPU frame plus
+    // frame generation plus half a frame of pacing (~42 ms, half the real frame rate). Hand it
+    // rendered frames instead (LICHII_DLSS_FG_PRESENT_WAIT=0 turns this off).
+    static const bool wait_render = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_PRESENT_WAIT");
+        return !value || value[0] != '0';
+    }();
+    if (wait_render && frame->frame_gen_token && frame->render_tick != 0) {
+        scheduler.GetMasterSemaphore().Wait(frame->render_tick);
+    }
+#endif
     while (swapchain.AcquireNextImage(!use_present_thread)) {
         RecreateSwapchain(frame);
     }
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::NoteFrameGenAcquire(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             acquire_begin)
+            .count()));
+#endif
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
     cmdbuf.Begin({
@@ -781,6 +916,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+#ifdef EGLANTINE_STREAMLINE
+    if (!frame->frame_gen_token && Streamline::WantsGenericFrameGen()) {
+        TagGenericFrameGen(frame, cmdbuf);
+    }
+#endif
 
     // HDR swapchains, HDR frames and frames left over from another swapchain format are drawn
     // with a colour conversion; plain SDR frames are blitted.
@@ -921,9 +1061,13 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
-        std::scoped_lock submit_lock{scheduler.submit_mutex};
+        std::unique_lock submit_lock{scheduler.submit_mutex, std::defer_lock};
+        if (!device.HasSwapchainQueue()) {
+            submit_lock.lock();
+        }
         switch (const VkResult result =
-                    device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
+                    (device.HasSwapchainQueue() ? device.GetSwapchainQueue() : device.GetGraphicsQueue())
+                        .Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
             break;
         case VK_ERROR_DEVICE_LOST:
@@ -936,7 +1080,15 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+#ifdef EGLANTINE_STREAMLINE
+    void* const frame_gen_token = std::exchange(frame->frame_gen_token, nullptr);
+    Streamline::FrameGenBeforePresent(frame_gen_token, frame->game_left, frame->game_top,
+                                      frame->game_right, frame->game_bottom);
+#endif
     last_present_id = swapchain.Present(render_semaphore);
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenAfterPresent(frame_gen_token);
+#endif
 }
 
 } // namespace Vulkan

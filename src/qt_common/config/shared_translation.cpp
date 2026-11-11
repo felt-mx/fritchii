@@ -170,6 +170,24 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Automatic picks the mode from the game's own resolution. Native (DLAA) keeps the "
               "game's resolution and only smooths it. Other modes apply when they fit the game's "
               "resolution, otherwise Automatic is used. Changes apply while playing."));
+    INSERT(Settings, nvidia_dlss_frame_gen, tr("NVIDIA DLSS Frame Generation (experimental)"),
+           tr("Generates frames between the game's own with NVIDIA DLSS Frame Generation and "
+              "Reflex (GeForce RTX 40 or newer).\nIn games that use their own DLSS (The Legend of "
+              "Zelda: Ocarina of Time...) it uses the game's motion vectors and depth, with "
+              "\"Use NVIDIA DLSS\" on. Other games use DLSS Frame Generation's optical flow alone "
+              "(see below).\nNeeds sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll and nvngx_dlssg.dll "
+              "next to sl.interposer.dll, or the NVIDIA app's copies. Presents without VSync. "
+              "Replaces the built-in frame generation while it runs.\nTakes effect when a game "
+              "starts."));
+    INSERT(Settings, nvidia_dlss_frame_gen_multiplier, tr("DLSS Frame Generation multiplier:"),
+           tr("2x generates one frame per rendered frame; 3x and 4x (Multi Frame Generation) "
+              "need a GeForce RTX 50. Capped at what the GPU and driver support. Applies while "
+              "playing."));
+    INSERT(Settings, nvidia_dlss_frame_gen_all_games,
+           tr("DLSS Frame Generation in games without DLSS"),
+           tr("For games that don't use their own DLSS: DLSS Frame Generation runs from its "
+              "optical flow alone (no motion vectors or depth from the game). Off: only games "
+              "with their own DLSS get it. Applies while playing."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
