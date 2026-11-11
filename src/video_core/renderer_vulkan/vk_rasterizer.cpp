@@ -41,6 +41,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
+#include "video_core/hdr_output.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
@@ -986,13 +987,26 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
     const auto hashes = pipeline->ShaderHashes();
-    if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
-        std::ranges::find(hashes, final_vertex) != hashes.end()) {
+    const bool final_pass = oot_4k_scene_frame == render_trace_frame &&
+                            hashes[5] == final_fragment &&
+                            std::ranges::find(hashes, final_vertex) != hashes.end();
+    // The HDR10 output may be drawn by another shader than the SDR one, so in HDR any draw to a
+    // 1440p RGB10A2 target counts; AccelerateDisplay still checks it is the image shown.
+    if (final_pass || (oot_4k_scene_frame == render_trace_frame && oot_4k_hdr)) {
         const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
         if (target_id) {
             const auto& target = texture_cache.GetImageView(target_id);
+            const auto output_format = oot_4k_hdr
+                                           ? VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM
+                                           : VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB;
             if (target.size.width == 2560 && target.size.height == 1440 &&
-                target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
+                target.format == output_format) {
+                if (oot_4k_hdr && !oot_4k_hdr_present_logged) {
+                    LOG_INFO(Render_Vulkan,
+                             "Ocarina temporal: HDR10 output drawn by fragment {:016x} ({})",
+                             hashes[5], final_pass ? "the SDR final pass" : "another pass");
+                    oot_4k_hdr_present_logged = true;
+                }
                 oot_4k_guest_present = target.ImageHandle();
             }
         }
@@ -3352,7 +3366,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             return fail("temporal upscaler declined the frame");
         }
         if (upscale_4k) {
-            oot_live_dlss->SaveSceneReference(scene_reference);
+            // A game told HDR presents HDR10, which the 4K composite needs a linear reference for.
+            oot_4k_hdr = VideoCommon::HdrOutput::CurrentStatus().hdr;
+            oot_live_dlss->SaveSceneReference(scene_reference, oot_4k_hdr);
             oot_4k_scene_frame = render_trace_frame;
             oot_4k_guest_present = VK_NULL_HANDLE;
         }
@@ -3725,13 +3741,26 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
     info.anti_aliased = oot_dlss_frame == render_trace_frame && !oot_live_dlss->EvaluationFailed();
-    if (oot_4k_scene_frame == render_trace_frame && info.image &&
-        info.image == oot_4k_guest_present && info.image_view &&
-        info.width == 2560 && info.height == 1440 && !scaled &&
-        image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&
-        !oot_live_dlss->EvaluationFailed() && !frame_dump.Capturing()) {
+    // HDR10 output gets the HDR composite, which writes HDR10 for the presenter to show as such.
+    const auto present_format = oot_4k_hdr ? VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM
+                                           : VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM;
+    const bool present_4k = oot_4k_scene_frame == render_trace_frame && info.image &&
+                            info.image == oot_4k_guest_present && info.image_view &&
+                            info.width == 2560 && info.height == 1440 && !scaled &&
+                            image_view->format == present_format &&
+                            config.pq_encoded == oot_4k_hdr;
+    if (oot_4k_hdr && !present_4k && oot_4k_scene_frame == render_trace_frame &&
+        !oot_4k_hdr_skip_logged) {
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina temporal: HDR10 4K presentation skipped (shown {}x{} format {}, HDR10 "
+                 "{}, matches the drawn output {})",
+                 info.width, info.height, static_cast<u32>(image_view->format), config.pq_encoded,
+                 info.image != VK_NULL_HANDLE && info.image == oot_4k_guest_present);
+        oot_4k_hdr_skip_logged = true;
+    }
+    if (present_4k && !oot_live_dlss->EvaluationFailed() && !frame_dump.Capturing()) {
         try {
-            oot_live_dlss->Composite4k(info.image_view, render_trace_frame);
+            oot_live_dlss->Composite4k(info.image_view, render_trace_frame, oot_4k_hdr);
             info.image = oot_live_dlss->CompositedImage();
             info.image_view = oot_live_dlss->CompositedView();
             info.scaled_width = 3840;

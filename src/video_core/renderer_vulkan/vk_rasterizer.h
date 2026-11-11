@@ -331,6 +331,9 @@ private:
     u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
+    bool oot_4k_hdr{}; ///< the game was told HDR when oot_4k_scene_frame's reference was saved
+    bool oot_4k_hdr_present_logged{};
+    bool oot_4k_hdr_skip_logged{};
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     VkImageView oot_effects_scene{};

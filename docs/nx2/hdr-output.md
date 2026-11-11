@@ -49,6 +49,11 @@ Screenshots and `EDEN_NX2_FRAME_CAPTURE` of HDR10 content are tone mapped to SDR
 - FXAA, SMAA, FSR and SGSR run on the PQ values of HDR10 content; their intermediates may be
   8-bit.
 - Frame generation keeps 8-bit present frames, so HDR10 content can band with it on.
+- Ocarina of Time's 4K DLSS presentation lays DLSS's detail over the game's HDR10 output
+  (`ocarina_dlss_4k_composite_hdr.comp`), comparing the two in scene units by their local
+  brightness ratio. Where they differ (HUD, effects, scene colour above SDR white) the game's 1440p
+  output is shown. The log names the shader that drew the HDR10 output, or why the 4K
+  presentation was skipped. Not yet checked on an HDR display.
 - Only the Vulkan renderer outputs HDR. OpenGL keeps reporting SDR to games.
 - Which images hold HDR10 is inferred from vi2 104 and the RGB10A2 format code; no title has
   been checked on hardware yet. A game that presents HDR in another format code shows as
