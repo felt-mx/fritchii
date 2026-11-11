@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+// ocarina_dlss_4k_composite.comp for a game presenting HDR10 (BT.2020, PQ). How the game maps its
+// scene to HDR isn't known, so the 4K detail DLSS adds is laid over the game's own HDR10 output:
+// that output is brought to scene units by the local ratio of its brightness to the scene's,
+// compared and mixed as in the SDR shader, then scaled back and encoded as PQ again.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D dlss_scene;       // 4K, square-root encoded, BT.709
+layout(binding = 1) uniform sampler2D native_scene;     // 1440p, linear, BT.709
+layout(binding = 2) uniform sampler2D native_composite; // 1440p, HDR10
+layout(binding = 3, rgba16f) uniform writeonly image2D output_color; // 4K, HDR10
+layout(push_constant) uniform Controls {
+    uint use_dlss;
+    float paper_white; // nits of SDR white the game was told
+} controls;
+
+// Linear BT.709 to BT.2020 (column-major), as in vulkan_present_hdr.frag.
+const mat3 BT709_TO_BT2020 = mat3(0.6274040, 0.0690970, 0.0163916,
+                                  0.3292820, 0.9195400, 0.0880132,
+                                  0.0433136, 0.0113612, 0.8955950);
+const vec3 BT2020_LUMA = vec3(0.2627, 0.6780, 0.0593);
+
+// SMPTE ST 2084.
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+vec3 PqToNits(vec3 e) {
+    vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / PQ_M2));
+    return 10000.0 * pow(max(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), vec3(1.0 / PQ_M1));
+}
+
+vec3 NitsToPq(vec3 nits) {
+    vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(PQ_M1));
+    return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), vec3(PQ_M2));
+}
+
+// The sRGB curve, used only as a perceptual scale for the comparison; it extends above 1.
+vec3 Encode(vec3 linear) {
+    linear = max(linear, vec3(0.0));
+    return mix(1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+               12.92 * linear, lessThan(linear, vec3(0.0031308)));
+}
+
+vec3 Decode(vec3 encoded) {
+    encoded = max(encoded, vec3(0.0));
+    return mix(pow((encoded + 0.055) / 1.055, vec3(2.4)),
+               encoded / 12.92, lessThan(encoded, vec3(0.04045)));
+}
+
+float MaxComponent(vec3 v) {
+    return max(max(v.r, v.g), v.b);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(output_color);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    vec3 composite_pq = textureLod(native_composite, uv, 0).rgb;
+    if (controls.use_dlss == 0) {
+        imageStore(output_color, pixel, vec4(composite_pq, 1.0));
+        return;
+    }
+    vec3 composite = PqToNits(composite_pq);
+
+    // Nits per scene unit around this pixel (about 3x3 texels at 1440p), pulled towards paper
+    // white where the scene is nearly black and held within 1/8 to 8 times paper white, so a HUD
+    // over a black scene can't amplify DLSS detail.
+    float paper_white = max(controls.paper_white, 1.0);
+    vec2 texel = 1.0 / vec2(textureSize(native_scene, 0));
+    const float prior = 0.04;
+    float composite_sum = prior * paper_white;
+    float scene_sum = prior;
+    for (int i = 0; i < 4; ++i) {
+        vec2 offset = vec2((i & 1) != 0 ? 1.0 : -1.0, (i & 2) != 0 ? 1.0 : -1.0) * texel;
+        composite_sum +=
+            dot(PqToNits(textureLod(native_composite, uv + offset, 0).rgb), BT2020_LUMA);
+        scene_sum +=
+            dot(BT709_TO_BT2020 * textureLod(native_scene, uv + offset, 0).rgb, BT2020_LUMA);
+    }
+    float scale = clamp(composite_sum / scene_sum, paper_white / 8.0, paper_white * 8.0);
+
+    vec3 encoded_scene = max(texelFetch(dlss_scene, pixel, 0).rgb, vec3(0.0));
+    vec3 scene_linear = textureLod(native_scene, uv, 0).rgb;
+    vec3 scene = Encode(BT709_TO_BT2020 * (encoded_scene * encoded_scene));
+    vec3 reference = Encode(BT709_TO_BT2020 * scene_linear);
+    vec3 game = Encode(composite / scale);
+    vec3 overlay = game - reference;
+    // As in the SDR shader: keep the game's output where HUD or postprocessing changed it.
+    float coverage = smoothstep(0.025, 0.12, MaxComponent(abs(overlay)));
+    // DLSS gets the scene the game tonemapped for SDR; brighter scene colour stays the game's.
+    coverage = max(coverage, smoothstep(1.0, 1.1, MaxComponent(scene_linear)));
+    vec3 mixed = mix(scene + overlay, game, coverage);
+    imageStore(output_color, pixel, vec4(NitsToPq(Decode(mixed) * scale), 1.0));
+}

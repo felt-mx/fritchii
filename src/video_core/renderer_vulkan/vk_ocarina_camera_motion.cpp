@@ -17,7 +17,9 @@
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_4k_composite_hdr_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_4k_reference_hdr_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -512,16 +514,26 @@ class OcarinaCompositePass final : public ComputePass {
         return result;
     }();
     static constexpr DescriptorBankInfo bank{.textures = 3, .images = 1, .score = 4};
-    static constexpr std::array push{VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u32)}};
+    // The SDR shader reads only use_dlss.
+    struct Controls {
+        u32 use_dlss;
+        f32 paper_white;
+    };
+    static constexpr std::array push{
+        VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Controls)}};
 
 public:
-    OcarinaCompositePass(const Device& device_, Scheduler& scheduler, DescriptorPool& pool)
+    OcarinaCompositePass(const Device& device_, Scheduler& scheduler, DescriptorPool& pool, bool hdr_)
         : ComputePass(device_, scheduler, pool, bindings, templates, bank, push,
-                      OCARINA_DLSS_4K_COMPOSITE_COMP_SPV) {}
+                      hdr_ ? std::span<const u32>(OCARINA_DLSS_4K_COMPOSITE_HDR_COMP_SPV)
+                           : std::span<const u32>(OCARINA_DLSS_4K_COMPOSITE_COMP_SPV)),
+          hdr{hdr_} {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
                 const OcarinaUpscaler& upscaler, u64 frame) {
-        scheduler.Record([this, descriptors, image, &upscaler, frame](vk::CommandBuffer cmd) {
+        const f32 paper_white = static_cast<f32>(Settings::values.hdr_paper_white.GetValue());
+        scheduler.Record([this, descriptors, image, &upscaler, frame,
+                          paper_white](vk::CommandBuffer cmd) {
             const auto output = ProbeBarrier(image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                              VK_IMAGE_LAYOUT_GENERAL);
@@ -537,7 +549,8 @@ public:
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
             const u32 enabled = !upscaler.EvaluationFailed();
-            cmd.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, enabled);
+            const Controls controls{.use_dlss = enabled, .paper_white = paper_white};
+            cmd.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, controls);
             cmd.Dispatch(3840 / 8, 2160 / 8, 1);
             const VkMemoryBarrier complete{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -547,13 +560,15 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0, complete);
             if (enabled && (!logged || frame % 120 == 0)) {
-                LOG_INFO(Render_Vulkan, "Ocarina temporal presented 3840x2160 frame={}", frame);
+                LOG_INFO(Render_Vulkan, "Ocarina temporal presented 3840x2160{} frame={}",
+                         hdr ? " HDR10" : "", frame);
                 logged = true;
             }
         });
     }
 
 private:
+    bool hdr;
     bool logged{};
 };
 
@@ -782,6 +797,14 @@ struct OcarinaUpscaler::Impl {
     vk::ImageView composite_view;
     std::unique_ptr<OcarinaColorPass> reference_pass;
     std::unique_ptr<OcarinaCompositePass> composite_pass;
+    // The same for a game presenting HDR10: float images, linear scene, PQ output.
+    vk::Image native_scene_hdr;
+    vk::ImageView native_scene_hdr_view;
+    vk::Image composite_hdr;
+    vk::ImageView composite_hdr_view;
+    std::unique_ptr<OcarinaColorPass> reference_hdr_pass;
+    std::unique_ptr<OcarinaCompositePass> composite_hdr_pass;
+    bool composited_hdr{};
     vk::Sampler linear_sampler;
     std::optional<u64> composited_frame;
     std::unique_ptr<OcarinaEffects> effects;
@@ -817,49 +840,58 @@ bool OcarinaUpscaler::EvaluationFailed() const {
     return impl->Failed();
 }
 
-void OcarinaUpscaler::SaveSceneReference(VkImageView color) {
+void OcarinaUpscaler::SaveSceneReference(VkImageView color, bool hdr) {
     auto& state = *impl;
     constexpr VkExtent2D extent{2560, 1440};
-    if (!state.native_scene_view) {
-        constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-        state.native_scene = CreateOcarinaImage(state.allocator, extent, format,
-                                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        state.native_scene_view = CreateOcarinaView(state.device, *state.native_scene, format);
-        state.reference_pass = std::make_unique<OcarinaColorPass>(
-            state.device, state.scheduler, state.pool, OCARINA_DLSS_4K_REFERENCE_COMP_SPV);
+    vk::Image& image = hdr ? state.native_scene_hdr : state.native_scene;
+    vk::ImageView& view = hdr ? state.native_scene_hdr_view : state.native_scene_view;
+    auto& pass = hdr ? state.reference_hdr_pass : state.reference_pass;
+    if (!view) {
+        const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        image = CreateOcarinaImage(state.allocator, extent, format,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        view = CreateOcarinaView(state.device, *image, format);
+        pass = std::make_unique<OcarinaColorPass>(
+            state.device, state.scheduler, state.pool,
+            hdr ? std::span<const u32>(OCARINA_DLSS_4K_REFERENCE_HDR_COMP_SPV)
+                : std::span<const u32>(OCARINA_DLSS_4K_REFERENCE_COMP_SPV));
     }
     state.queue.Acquire(state.scheduler, 2);
     state.queue.AddSampledImage(color, state.PointSampler());
-    state.queue.AddImage(*state.native_scene_view);
-    state.reference_pass->Record(state.scheduler, state.queue.UpdateData(), *state.native_scene,
-                                 extent, this);
+    state.queue.AddImage(*view);
+    pass->Record(state.scheduler, state.queue.UpdateData(), *image, extent, this);
     state.scheduler.InvalidateState();
 }
 
-void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame) {
+void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame, bool hdr) {
     auto& state = *impl;
     if (state.composited_frame == frame) {
         return;
     }
-    if (!state.composite_pass) {
-        constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-        state.composite = CreateOcarinaImage(state.allocator, {3840, 2160}, format,
-                                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        state.composite_view = CreateOcarinaView(state.device, *state.composite, format);
-        state.composite_pass = std::make_unique<OcarinaCompositePass>(
-            state.device, state.scheduler, state.pool);
+    vk::Image& image = hdr ? state.composite_hdr : state.composite;
+    vk::ImageView& view = hdr ? state.composite_hdr_view : state.composite_view;
+    auto& pass = hdr ? state.composite_hdr_pass : state.composite_pass;
+    if (!pass) {
+        // HDR10 needs more than 8 bits per channel.
+        const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        image = CreateOcarinaImage(state.allocator, {3840, 2160}, format,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        view = CreateOcarinaView(state.device, *image, format);
+        pass = std::make_unique<OcarinaCompositePass>(state.device, state.scheduler, state.pool,
+                                                      hdr);
     }
     state.scheduler.RequestOutsideRenderPassOperationContext();
     state.queue.Acquire(state.scheduler, 4);
     const auto sampler = state.LinearSampler();
     state.queue.AddSampledImage(state.OutputView(), sampler);
-    state.queue.AddSampledImage(*state.native_scene_view, sampler);
+    state.queue.AddSampledImage(hdr ? *state.native_scene_hdr_view : *state.native_scene_view,
+                                sampler);
     state.queue.AddSampledImage(native_composite, sampler);
-    state.queue.AddImage(*state.composite_view);
-    state.composite_pass->Record(state.scheduler, state.queue.UpdateData(), *state.composite,
-                                 *this, frame);
+    state.queue.AddImage(*view);
+    pass->Record(state.scheduler, state.queue.UpdateData(), *image, *this, frame);
     state.scheduler.InvalidateState();
     state.composited_frame = frame;
+    state.composited_hdr = hdr;
 }
 
 void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 frame) {
@@ -910,11 +942,11 @@ void OcarinaUpscaler::MarkEffects(VkImageView scene, u64 frame) {
 }
 
 VkImage OcarinaUpscaler::CompositedImage() const {
-    return *impl->composite;
+    return impl->composited_hdr ? *impl->composite_hdr : *impl->composite;
 }
 
 VkImageView OcarinaUpscaler::CompositedView() const {
-    return *impl->composite_view;
+    return impl->composited_hdr ? *impl->composite_hdr_view : *impl->composite_view;
 }
 
 bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
