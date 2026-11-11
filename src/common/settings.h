@@ -414,6 +414,30 @@ struct Values {
                                                    Specialization::Default,
                                                    true,
                                                    true};
+    // NVIDIA DLSS Frame Generation (DLSS-G, through NVIDIA Streamline), with Reflex
+    // (zortos293/Lichii#1291). RTX 40 and newer; 3x and 4x (Multi Frame Generation) need an
+    // RTX 50. Global only, like nvidia_dlss.
+    Setting<bool> nvidia_dlss_frame_gen{linkage, false, "nvidia_dlss_frame_gen", Category::Renderer};
+    Setting<u32, true> nvidia_dlss_frame_gen_multiplier{linkage,
+                                                        2,
+                                                        2,
+                                                        4,
+                                                        "nvidia_dlss_frame_gen_multiplier",
+                                                        Category::Renderer,
+                                                        Specialization::Countable,
+                                                        true,
+                                                        true,
+                                                        &nvidia_dlss_frame_gen};
+    // Games without their own DLSS (no motion vectors or depth to hand over): DLSS-G runs on its
+    // optical flow alone, from zero motion and a flat depth.
+    Setting<bool> nvidia_dlss_frame_gen_all_games{linkage,
+                                                  true,
+                                                  "nvidia_dlss_frame_gen_all_games",
+                                                  Category::Renderer,
+                                                  Specialization::Default,
+                                                  true,
+                                                  true,
+                                                  &nvidia_dlss_frame_gen};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",

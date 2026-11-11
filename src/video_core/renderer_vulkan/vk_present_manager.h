@@ -51,6 +51,9 @@ struct Frame {
     /// Time the present thread leaves before presenting the next frame. Frame generation sets it
     /// on generated frames, so they share the screen time evenly with the real ones.
     std::chrono::nanoseconds present_spacing{};
+    void* frame_gen_token{}; ///< DLSS Frame Generation: the frame's Streamline token, if any
+    /// Where the game image is in the frame (and the swapchain image), for DLSS Frame Generation.
+    u32 game_left{}, game_top{}, game_right{}, game_bottom{};
 };
 
 class PresentManager {
@@ -182,6 +185,15 @@ private:
     std::condition_variable shown_cv;
     std::vector<ShownReport> shown_reports;
     std::jthread present_wait_thread;
+
+    /// DLSS Frame Generation for frames without the game's own motion and depth: constant zero
+    /// motion and far depth at the game rectangle's size (present thread only).
+    void TagGenericFrameGen(Frame* frame, vk::CommandBuffer cmdbuf);
+    vk::Image fg_generic_depth;
+    vk::ImageView fg_generic_depth_view;
+    vk::Image fg_generic_motion;
+    vk::ImageView fg_generic_motion_view;
+    VkExtent2D fg_generic_extent{};
 };
 
 } // namespace Vulkan
