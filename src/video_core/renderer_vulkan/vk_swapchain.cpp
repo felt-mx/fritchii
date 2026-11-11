@@ -69,6 +69,14 @@ bool FrameGenRequested() {
 #endif
 }
 
+// Whether frame generation needs 8-bit present frames: Lossless Scaling's shaders store rgba8,
+// FSR 3's store any format, so FSR 3 keeps HDR frames where the GPU can store to them.
+bool FrameGenNeedsSdrFrames(bool hdr_frame_storage) {
+    return FrameGenRequested() &&
+           (Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3 ||
+            !hdr_frame_storage);
+}
+
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed) {
     // Mailbox doesn't lock the application like FIFO (vsync)
@@ -155,6 +163,8 @@ Swapchain::Swapchain(
     , device{device_}
     , scheduler{scheduler_}
 {
+    const VkFormatProperties props = device.GetPhysical().GetFormatProperties(HdrFrameFormat);
+    hdr_frame_storage = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     Create(surface, width_, height_);
 }
 
@@ -321,7 +331,7 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     const VkSurfaceFormatKHR previous_format = surface_format;
     hdr_requested = Settings::values.hdr_output.GetValue();
-    frame_gen_requested = FrameGenRequested();
+    frame_gen_sdr_frames = FrameGenNeedsSdrFrames(hdr_frame_storage);
     const std::optional<VkSurfaceFormatKHR> hdr_format =
         hdr_requested ? ChooseHdrSurfaceFormat(formats) : std::nullopt;
     if (hdr_requested && !hdr_format && !hdr_unavailable_logged) {
@@ -420,8 +430,8 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     images = swapchain.GetImages();
     image_count = static_cast<u32>(images.size());
     // Android's SdrFrameFormat is already ordered the same as Switch.
-    image_view_format = output == SwapchainOutput::Sdr || frame_gen_requested ? SdrFrameFormat
-                                                                               : HdrFrameFormat;
+    image_view_format = output == SwapchainOutput::Sdr || frame_gen_sdr_frames ? SdrFrameFormat
+                                                                                : HdrFrameFormat;
     ++generation;
     metadata_peak = 0;
     metadata_paper_white = 0;
@@ -479,7 +489,8 @@ bool Swapchain::NeedsPresentModeUpdate() const {
 
 bool Swapchain::NeedsOutputUpdate() const {
     return hdr_requested != Settings::values.hdr_output.GetValue() ||
-           (output != SwapchainOutput::Sdr && frame_gen_requested != FrameGenRequested());
+           (output != SwapchainOutput::Sdr &&
+            frame_gen_sdr_frames != FrameGenNeedsSdrFrames(hdr_frame_storage));
 }
 
 } // namespace Vulkan

@@ -83,10 +83,13 @@ public:
     [[nodiscard]] VkFormat SwapchainImageFormat() const { return swapchain_image_format; }
     /// Format to render present frames in for the current swapchain.
     [[nodiscard]] VkFormat FrameFormat() const { return frame_format; }
-    /// Image format of frames in SdrFrameFormat, the only ones frame generation runs on.
-    [[nodiscard]] VkFormat SdrFrameImageFormat() const { return sdr_frame_image_format; }
+    /// Image format of `frame`: SdrFrameFormat frames use the SDR swapchain's format.
+    [[nodiscard]] VkFormat FrameImageFormat(const Frame& frame) const;
 
 private:
+    /// Whether frame generation can store to frames of this view format.
+    [[nodiscard]] bool CanStore(const Frame* frame, VkFormat view_format) const;
+
     void PresentThread(std::stop_token token);
 
     /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
@@ -130,6 +133,7 @@ private:
     std::jthread present_thread;
     bool blit_supported;
     bool storage_supported;
+    bool hdr_storage_supported; ///< To HdrFrameFormat frames, for FSR 3 frame generation
     bool use_present_thread;
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};

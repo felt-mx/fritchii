@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -218,6 +219,13 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 
     if (!frame->storage_view) {
+        warm_streak = 0;
+        return;
+    }
+    // Lossless Scaling's shaders store rgba8; HDR frames remain only until the swapchain makes
+    // SDR frames for it after the type changed.
+    if (Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3 &&
+        format == HdrFrameFormat) {
         warm_streak = 0;
         return;
     }
