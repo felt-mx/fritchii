@@ -48,6 +48,9 @@ struct Frame {
     bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
+    /// Time the present thread leaves before presenting the next frame. Frame generation sets it
+    /// on generated frames, so they share the screen time evenly with the real ones.
+    std::chrono::nanoseconds present_spacing{};
 };
 
 class PresentManager {
@@ -90,7 +93,13 @@ private:
     /// Whether frame generation can store to frames of this view format.
     [[nodiscard]] bool CanStore(const Frame* frame, VkFormat view_format) const;
 
+    void StartPresentThread();
+
     void PresentThread(std::stop_token token);
+
+    /// With EDEN_DKB_FRAME_TRACE=1 and frame generation on, logs the presents of every 10 s.
+    void LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
+                   std::chrono::steady_clock::time_point now);
 
     /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
     /// `frame` until its target. Returns whether it was held.
@@ -141,6 +150,15 @@ private:
     std::atomic<VkFormat> frame_format{};
     std::atomic<VkFormat> sdr_frame_image_format{}; ///< Image format of SdrFrameFormat frames
     std::optional<HdrOutputPass> hdr_output;        ///< Present thread only
+    /// The present thread presents no frame before this (Frame::present_spacing).
+    std::chrono::steady_clock::time_point next_present{};
+    struct {
+        std::chrono::steady_clock::time_point since{};
+        u64 real{};
+        u64 generated{};
+        std::chrono::nanoseconds spacing{};
+        std::chrono::steady_clock::duration present_time{};
+    } pacing_log;
 
     // Host frame pacer, used when the device supports VK_KHR_present_wait (present thread only).
     struct PendingWait {
