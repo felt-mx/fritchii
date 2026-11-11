@@ -286,7 +286,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
 
-    frame_gen.Process(device, frame, present_manager.SdrFrameImageFormat(),
+    frame_gen.Process(device, frame, present_manager.FrameImageFormat(*frame),
                       GuestExtent(framebuffers));
 
     const size_t generated_frames = frame_gen.GeneratedFrameCount();

@@ -139,6 +139,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
                                         swapchain.GetOutput() == SwapchainOutput::Sdr
                                             ? swapchain.GetImageFormat()
                                             : SdrFrameFormat)}
+    , hdr_storage_supported{CanStoreToFrame(device.GetPhysical(), HdrFrameFormat)}
     , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
@@ -242,8 +243,20 @@ size_t PresentManager::MaxExtraFrames() const {
 }
 
 bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
-    return required && frame->storage_capable && !frame->storage_view &&
-           frame->format == SdrFrameFormat;
+    return required && !frame->storage_view && CanStore(frame, frame->format);
+}
+
+bool PresentManager::CanStore(const Frame* frame, VkFormat view_format) const {
+    // SDR frames for either frame generation, HDR frames for FSR 3 (the swapchain picks SDR
+    // frames for Lossless Scaling).
+    if (view_format == SdrFrameFormat) {
+        return frame->storage_capable;
+    }
+    return view_format == HdrFrameFormat && hdr_storage_supported;
+}
+
+VkFormat PresentManager::FrameImageFormat(const Frame& frame) const {
+    return frame.format == SdrFrameFormat ? sdr_frame_image_format.load() : frame.format;
 }
 
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
@@ -258,9 +271,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
     const VkFormat image_format =
         image_view_format == SdrFrameFormat ? sdr_frame_image_format.load() : image_view_format;
 
-    // Frame generation stores rgba8 (storage_supported was checked for the SDR format).
-    const bool with_storage =
-        storage && frame->storage_capable && image_view_format == SdrFrameFormat;
+    const bool with_storage = storage && CanStore(frame, image_view_format);
     VkImageUsageFlags storage_usage = 0;
     if (with_storage) {
         storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
