@@ -309,11 +309,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
+          # -w: src/CMakeLists.txt gives clang-cl the GCC branch's -Wall, which clang-cl reads as
+          # -Weverything, plus a stale-profile warning per changed function; the log ran to
+          # hundreds of thousands of lines. Errors still show.
+          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin -w"
           if [ -n '${{ matrix.profile }}' ]; then
             flags+=" -fprofile-use=$(cygpath -m "$PWD/${{ matrix.profile }}")"
-            flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
-            flags+=" -Wno-error=backend-plugin"
           fi
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
