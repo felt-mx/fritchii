@@ -6,7 +6,7 @@ name: sync-upstream-release
 on:
   schedule:
     # Off the :00/:30 marks, where GitHub drops scheduled runs under load.
-    - cron: "17,47 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       tag:
