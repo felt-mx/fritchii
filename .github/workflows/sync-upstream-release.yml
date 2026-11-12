@@ -5,7 +5,8 @@ name: sync-upstream-release
 # main. GitHub has no cross-repo release event, so this polls.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Off the :00/:30 marks, where GitHub drops scheduled runs under load.
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       tag:
