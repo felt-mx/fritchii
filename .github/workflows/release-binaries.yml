@@ -25,6 +25,10 @@ on:
       - "cpmfile.json"
       - "*.profdata"
       - ".github/workflows/release-binaries.yml"
+  # Builds without publishing. No paths filter: the upstream sync PRs need this check to report.
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read

@@ -1,0 +1,191 @@
+name: sync-upstream-release
+
+# Opens an auto-merging PR from sync/<tag> into main for each new Frizti/Fritchii release. The PR's
+# release-binaries build is the required check; once the PR merges, release-binaries publishes from
+# main. GitHub has no cross-repo release event, so this polls.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to merge (blank = newest release)
+        type: string
+        default: ""
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: Frizti/Fritchii
+  TARGET_BRANCH: main
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: sync-upstream-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find upstream release
+        id: release
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            # Upstream marks its releases as pre-releases, so releases/latest would skip them.
+            tag=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=20" \
+              --jq '[.[] | select(.draft | not)][0].tag_name // empty')
+          fi
+          if [ -z "$tag" ]; then
+            echo "No upstream release found"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/$tag" >> "$GITHUB_OUTPUT"
+          echo "Upstream release: $tag"
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          # GITHUB_TOKEN may not push upstream commits that touched .github/workflows (even though
+          # the merge keeps ours), and PRs it opens start no workflows. SYNC_TOKEN can do both.
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Check whether the release still needs syncing
+        id: check
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" "+refs/tags/${TAG}:refs/tags/${TAG}"
+          tag_sha=$(git rev-parse "${TAG}^{commit}")
+          echo "tag_sha=$tag_sha" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag_sha" HEAD; then
+            echo "$TAG is already in $TARGET_BRANCH"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            # Its PR is still open: building, or failed and waiting for a fix.
+            echo "$BRANCH already exists; leaving it alone"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif issue=$(gh issue list --state open --search "\"Upstream $TAG \" in:title" \
+                 --json number --jq '.[0].number // empty') && [ -n "$issue" ]; then
+            # Closing the issue makes the next poll try again.
+            echo "Waiting on issue #$issue for $TAG"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge release into the sync branch
+        if: steps.check.outputs.needed == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          TAG_SHA: ${{ steps.check.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+
+          git merge --no-ff --no-commit "$TAG_SHA" || true
+          # Our CI differs from upstream's, so .github always stays exactly as main has it.
+          git rm -r -q --ignore-unmatch .github
+          git checkout HEAD -- .github
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -n "$conflicts" ]; then
+            git merge --abort
+            echo "Upstream $TAG does not merge cleanly into $TARGET_BRANCH" > "$RUNNER_TEMP/issue_title"
+            {
+              echo "The scheduled sync could not merge ${UPSTREAM_REPO} release \`${TAG}\` into \`${TARGET_BRANCH}\`."
+              echo
+              echo "Conflicting files:"
+              echo
+              sed 's/^/- `/; s/$/`/' <<< "$conflicts"
+              echo
+              echo "Merge it by hand (keep our \`.github\`) and push to \`${TARGET_BRANCH}\`."
+              echo "Or close this issue to have the next poll try again."
+            } > "$RUNNER_TEMP/issue_body.md"
+            exit 1
+          fi
+
+          git commit -q -m "Merge Fritchii ${TAG#fritchii-} into ${TARGET_BRANCH}" \
+            -m "${UPSTREAM_REPO} at ${TAG_SHA} (release ${TAG}). .github kept as on ${TARGET_BRANCH}."
+          git push origin "$BRANCH"
+
+      - name: Open an auto-merging PR
+        if: steps.check.outputs.needed == 'true'
+        shell: bash
+        env:
+          # Opened with SYNC_TOKEN so the PR's checks run and its merge starts the publish job.
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          TAG_SHA: ${{ steps.check.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Merges ${UPSTREAM_REPO} release [\`${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}) (\`${TAG_SHA}\`)."
+            echo "\`.github\` is kept as on \`${TARGET_BRANCH}\`."
+            echo
+            echo "Merges itself once release-binaries builds. If the build fails, push a fix to \`${BRANCH}\`."
+            echo "After the merge, release-binaries publishes a release from \`${TARGET_BRANCH}\`."
+          } > "$RUNNER_TEMP/pr_body.md"
+          url=$(gh pr create --base "$TARGET_BRANCH" --head "$BRANCH" \
+            --title "Merge Fritchii ${TAG#fritchii-}" --body-file "$RUNNER_TEMP/pr_body.md")
+          echo "Opened $url"
+          # A merge commit, never squash or rebase: main must keep upstream's history.
+          gh pr merge "$url" --auto --merge
+
+      # One open issue per problem; later polls skip the release while it is open.
+      - name: Open an issue
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -f "$RUNNER_TEMP/issue_title" ] || exit 0
+          title=$(cat "$RUNNER_TEMP/issue_title")
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing already open"
+            exit 0
+          fi
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/issue_body.md"
+
+  publish:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged &&
+      startsWith(github.head_ref, 'sync/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: ${{ github.head_ref }}
+    steps:
+      - name: Run release-binaries on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run release-binaries.yml --ref "$TARGET_BRANCH" -f publish_release=true
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" || true
