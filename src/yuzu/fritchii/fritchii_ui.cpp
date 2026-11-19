@@ -160,9 +160,12 @@ bool ApplyTheme() {
     return true;
 }
 
-bool HidesSetting(const std::string& label) {
-    // Frame generation is offered; only its optical flow dump (a dev tool) stays hidden.
-    return Enabled() && label == "frame_gen_dump_flow";
+QIcon IconTinted(const QString& name, const QColor& color, int px) {
+    QFile file(QStringLiteral(":/fritchii/icons/%1.svg").arg(name));
+    if (!file.open(QFile::ReadOnly)) {
+        return {};
+    }
+    return QIcon(RenderSvg(file.readAll(), color, px));
 }
 
 QIcon Icon(const QString& name, int px) {
@@ -220,6 +223,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     view->addAction(ui.action_Single_Window_Mode);
     view->addSeparator();
     view->addAction(ui.action_Show_Performance_Overlay);
+    view->addAction(ui.action_Show_Frame_Times);
     view->addAction(ui.action_Show_Status_Bar);
     view->addAction(ui.action_Show_Filter_Bar);
     view->addSeparator();
@@ -257,7 +261,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     tools->addMenu(advanced);
     ui.menubar->removeAction(ui.menu_Multiplayer->menuAction());
 
-    // Help: the log first; Eden's mods page leaves the menu.
+    // Help: the log first; the original mods page leaves the menu.
     auto* export_log = new QAction(tr("&Export Log..."), &window);
     QObject::connect(export_log, &QAction::triggered, &window, hooks.export_log);
     ui.menu_Help->removeAction(ui.action_Open_Mods_Page);
@@ -315,6 +319,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Carousel_View, tr("&Carousel"));
     Rename(ui.action_Show_Game_Name, tr("Show Game &Names"));
     Rename(ui.action_Show_Performance_Overlay, tr("&Performance Overlay"));
+    Rename(ui.action_Show_Frame_Times, tr("Overlay &Frame Times"));
     Rename(ui.action_Show_Status_Bar, tr("&Status Bar"));
     Rename(ui.action_Show_Filter_Bar, tr("Search &Bar"));
     Rename(ui.action_Single_Window_Mode, tr("Single &Window"));
@@ -556,7 +561,7 @@ void CopyDataFromOldFolder(QMainWindow& window) {
     if (IsPortableMode()) {
         QMessageBox::information(&window, QStringLiteral("Fritchii"),
                                  QObject::tr("This Fritchii keeps its data in the user folder next to "
-                                    "lichii.exe."));
+                                    "fritchii.exe."));
         return;
     }
     const bool any = std::ranges::any_of(

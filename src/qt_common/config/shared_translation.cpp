@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shared_translation.h"
@@ -140,6 +139,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
+    INSERT(Settings, vulkan_device_name, QString(), QString());
     INSERT(Settings, resolution_setup, tr("Resolution:"),
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
@@ -149,8 +149,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
               "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
-              "of the session if its output fails Lichii's checks.\nTakes effect when a game "
-              "starts."));
+              "of the session if its output fails Fritchii's checks.\nWith NVIDIA DLSS turned on "
+              "and available, NVIDIA DLSS is used instead.\nTakes effect when a game starts."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
@@ -161,7 +161,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
-              "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
+              "the NVIDIA app has downloaded it; Fritchii does not ship NVIDIA's files. Use the "
               "download button below.\nFire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
@@ -176,8 +176,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Zelda: Ocarina of Time...) it uses the game's motion vectors and depth, with "
               "\"Use NVIDIA DLSS\" on. Other games use DLSS Frame Generation's optical flow alone "
               "(see below).\nNeeds sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll and nvngx_dlssg.dll "
-              "next to sl.interposer.dll, or the NVIDIA app's copies. Presents without VSync. "
-              "Replaces the built-in frame generation while it runs.\nTakes effect when a game "
+              "next to sl.interposer.dll, or the NVIDIA app's copies. Presents without VSync "
+              "(OoT's Unlimited cap then holds the display rate).\nTakes effect when a game "
               "starts."));
     INSERT(Settings, nvidia_dlss_frame_gen_multiplier, tr("DLSS Frame Generation multiplier:"),
            tr("2x generates one frame per rendered frame; 3x and 4x (Multi Frame Generation) "
@@ -188,6 +188,17 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("For games that don't use their own DLSS: DLSS Frame Generation runs from its "
               "optical flow alone (no motion vectors or depth from the game). Off: only games "
               "with their own DLSS get it. Applies while playing."));
+    INSERT(Settings, oot_dlss_jitter, tr("DLSS jitter"),
+           tr("Tiny camera shifts each frame that DLSS uses for smoother edges. On by "
+              "default.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_texture_sharpness, tr("Texture sharpness:"),
+           tr("Auto matches OoT's render and output sizes. Sharper goes half a step further. "
+              "Custom uses the LOD bias you set.\nTakes effect when the game starts."));
+    // Set by the picture menu's "Resolution" row (ConfigureGraphics::UpdatePictureMenu).
+    INSERT(Settings, oot_upscale_output, QString(), QString());
+    INSERT(Settings, oot_lod_bias_custom, tr("LOD bias:"),
+           tr("Lower is sharper. Too low makes textures shimmer.\nTakes effect when the game "
+              "starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -258,15 +269,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_red, QString(), QString());
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
-
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
-    INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
-    INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
-    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
-    INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
-    INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
-    INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
-    INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     INSERT(Settings, hdr_output, tr("HDR output (Vulkan only)"),
            tr("Presents in HDR10 when the display has HDR turned on in the system settings, and "
@@ -603,13 +605,9 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
-    translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                          {
-                              PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
-                              PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
-                          }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
+                              PAIR(ScalingFilter, Auto, tr("Auto (recommended)")),
                               PAIR(ScalingFilter, NearestNeighbor, tr("Nearest Neighbor")),
                               PAIR(ScalingFilter, Bilinear, tr("Bilinear")),
                               PAIR(ScalingFilter, Bicubic, tr("Bicubic")),
@@ -661,6 +659,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotRefreshCap, Hz120, tr("120 FPS")),
                               PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
                               PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
+                              PAIR(OotRefreshCap, Unlimited, tr("Unlimited (can crash with VSync off)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotTextureSharpness>::Index(),
+                          {
+                              PAIR(OotTextureSharpness, Auto, tr("Auto")),
+                              PAIR(OotTextureSharpness, Sharper, tr("Sharper")),
+                              PAIR(OotTextureSharpness, Custom, tr("Custom")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

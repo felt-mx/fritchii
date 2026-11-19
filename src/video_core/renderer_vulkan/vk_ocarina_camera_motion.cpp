@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <optional>
+#include <string>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -14,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
+#include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
@@ -21,6 +26,7 @@
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_hdr_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -34,6 +40,7 @@
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/small_card.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
@@ -530,9 +537,9 @@ public:
           hdr{hdr_} {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
-                const OcarinaUpscaler& upscaler, u64 frame) {
+                const OcarinaUpscaler& upscaler, u64 frame, VkExtent2D extent) {
         const f32 paper_white = static_cast<f32>(Settings::values.hdr_paper_white.GetValue());
-        scheduler.Record([this, descriptors, image, &upscaler, frame,
+        scheduler.Record([this, descriptors, image, &upscaler, frame, extent,
                           paper_white](vk::CommandBuffer cmd) {
             const auto output = ProbeBarrier(image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -551,7 +558,7 @@ public:
             const u32 enabled = !upscaler.EvaluationFailed();
             const Controls controls{.use_dlss = enabled, .paper_white = paper_white};
             cmd.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, controls);
-            cmd.Dispatch(3840 / 8, 2160 / 8, 1);
+            cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
             const VkMemoryBarrier complete{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -560,8 +567,8 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0, complete);
             if (enabled && (!logged || frame % 120 == 0)) {
-                LOG_INFO(Render_Vulkan, "Ocarina temporal presented 3840x2160{} frame={}",
-                         hdr ? " HDR10" : "", frame);
+                LOG_INFO(Render_Vulkan, "Ocarina temporal presented {}x{}{} frame={}",
+                         extent.width, extent.height, hdr ? " HDR10" : "", frame);
                 logged = true;
             }
         });
@@ -670,8 +677,10 @@ struct OcarinaFrameSlot {
                               allocator, extent, MOTION_FORMAT, VK_IMAGE_USAGE_STORAGE_BIT |
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
           motion_view{CreateOcarinaView(device, *motion, MOTION_FORMAT)},
+          // TRANSFER_SRC: the FSR 4 output check reads a few pixels of it.
           color{CreateOcarinaImage(allocator, extent, LIVE_COLOR_FORMAT,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT)},
           color_view{CreateOcarinaView(device, *color, LIVE_COLOR_FORMAT)} {}
 
     VkExtent2D extent;
@@ -720,7 +729,11 @@ struct OcarinaUpscaler::Impl {
          VideoCommon::OcarinaUpscaleBackend backend)
         : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool},
           motion_pass{device, scheduler, pool},
-          color_pass{device, scheduler, pool},
+          // FRITCHII_DLSS_SANITIZE=0: the exact copy instead of the clamped input.
+          color_pass{device, scheduler, pool,
+                     VideoCommon::OcarinaDlssSanitize()
+                         ? std::span<const u32>(OCARINA_DLSS_COLOR_COMP_SPV)
+                         : std::span<const u32>(OCARINA_DLSS_EFFECTS_BASE_COMP_SPV)},
           output_pass{device, scheduler, pool, OCARINA_DLSS_OUTPUT_COMP_SPV} {
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
@@ -795,6 +808,9 @@ struct OcarinaUpscaler::Impl {
     vk::ImageView native_scene_view;
     vk::Image composite;
     vk::ImageView composite_view;
+    VkExtent2D composite_extent{};
+    /// The last recorded frame's output size (the composite's size).
+    VkExtent2D last_output{3840, 2160};
     std::unique_ptr<OcarinaColorPass> reference_pass;
     std::unique_ptr<OcarinaCompositePass> composite_pass;
     // The same for a game presenting HDR10: float images, linear scene, PQ output.
@@ -802,6 +818,7 @@ struct OcarinaUpscaler::Impl {
     vk::ImageView native_scene_hdr_view;
     vk::Image composite_hdr;
     vk::ImageView composite_hdr_view;
+    VkExtent2D composite_hdr_extent{};
     std::unique_ptr<OcarinaColorPass> reference_hdr_pass;
     std::unique_ptr<OcarinaCompositePass> composite_hdr_pass;
     bool composited_hdr{};
@@ -868,17 +885,27 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame, bool 
     if (state.composited_frame == frame) {
         return;
     }
-    vk::Image& image = hdr ? state.composite_hdr : state.composite;
-    vk::ImageView& view = hdr ? state.composite_hdr_view : state.composite_view;
+    const VkExtent2D extent = state.last_output;
     auto& pass = hdr ? state.composite_hdr_pass : state.composite_pass;
     if (!pass) {
-        // HDR10 needs more than 8 bits per channel.
-        const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-        image = CreateOcarinaImage(state.allocator, {3840, 2160}, format,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        view = CreateOcarinaView(state.device, *image, format);
         pass = std::make_unique<OcarinaCompositePass>(state.device, state.scheduler, state.pool,
                                                       hdr);
+    }
+    // The composite reads the upscaler's output pixel for pixel: it has the output's size
+    // (oot_upscale_output; 4K before).
+    vk::Image& image = hdr ? state.composite_hdr : state.composite;
+    vk::ImageView& view = hdr ? state.composite_hdr_view : state.composite_view;
+    VkExtent2D& image_extent = hdr ? state.composite_hdr_extent : state.composite_extent;
+    if (!image || image_extent.width != extent.width || image_extent.height != extent.height) {
+        if (image) {
+            state.scheduler.Finish(); // the old image may still be read by a present
+        }
+        // HDR10 needs more than 8 bits per channel.
+        const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        image = CreateOcarinaImage(state.allocator, extent, format,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        view = CreateOcarinaView(state.device, *image, format);
+        image_extent = extent;
     }
     state.scheduler.RequestOutsideRenderPassOperationContext();
     state.queue.Acquire(state.scheduler, 4);
@@ -888,7 +915,7 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame, bool 
                                 sampler);
     state.queue.AddSampledImage(native_composite, sampler);
     state.queue.AddImage(*view);
-    pass->Record(state.scheduler, state.queue.UpdateData(), *image, *this, frame);
+    pass->Record(state.scheduler, state.queue.UpdateData(), *image, *this, frame, extent);
     state.scheduler.InvalidateState();
     state.composited_frame = frame;
     state.composited_hdr = hdr;
@@ -898,7 +925,7 @@ void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 
     auto& state = *impl;
     if (!state.effects_base_pass) {
         state.effects_base_pass = std::make_unique<OcarinaEffectsPass<1>>(
-            state.device, state.scheduler, state.pool, OCARINA_DLSS_COLOR_COMP_SPV);
+            state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_BASE_COMP_SPV);
         state.effects_mark_pass = std::make_unique<OcarinaEffectsPass<2>>(
             state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_COMP_SPV);
         state.effects_bias_pass = std::make_unique<OcarinaEffectsPass<3>>(
@@ -947,6 +974,10 @@ VkImage OcarinaUpscaler::CompositedImage() const {
 
 VkImageView OcarinaUpscaler::CompositedView() const {
     return impl->composited_hdr ? *impl->composite_hdr_view : *impl->composite_view;
+}
+
+VkExtent2D OcarinaUpscaler::CompositedExtent() const {
+    return impl->composited_hdr ? impl->composite_hdr_extent : impl->composite_extent;
 }
 
 bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
@@ -1032,11 +1063,12 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                                COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .render_size = extent,
             .upscale_size = output_extent,
-            // EDEN_NX2_DLSS_JITTER: the scene's offset this frame (1), or with y flipped (2).
-            .jitter = {VideoCommon::OcarinaDlssJitterMode() != 0 ? jitter[0] : 0.0f,
-                       VideoCommon::OcarinaDlssJitterMode() == 2   ? -jitter[1]
-                       : VideoCommon::OcarinaDlssJitterMode() != 0 ? jitter[1]
-                                                                   : 0.0f},
+            // The offset the scene moved by this frame, in render pixels with y down (0 when the
+            // DLSS jitter is off: no scene draw was offset). The convention of NVIDIA's own
+            // Streamline sample (Donut: projection + (2x / w, -2y / h), the same values to
+            // sl::Constants::jitterOffset) and of AMD's FSR, so it goes as is to both, and to
+            // NGX's InJitterOffset. EDEN_NX2_DLSS_JITTER=2 flips y, as a test only.
+            .jitter = {jitter[0], VideoCommon::OcarinaDlssJitterFlipY() ? -jitter[1] : jitter[1]},
             .motion_vector_scale = {1.0f, 1.0f},
             .reset = reset,
             .depth_inverted = false,
@@ -1132,6 +1164,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     state.scheduler.InvalidateState();
     state.last_frame = frame;
     state.last_view_projection = current;
+    state.last_output = output_extent;
     return true;
 }
 VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) {
@@ -1140,13 +1173,50 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
 #ifdef EGLANTINE_STREAMLINE
     dlss_available = Streamline::IsDlssAvailable();
 #endif
-    const auto backend = VideoCommon::SelectOcarinaUpscaler(
+    auto backend = VideoCommon::SelectOcarinaUpscaler(
         Settings::values.oot_anti_aliasing.GetValue(), Settings::values.nvidia_dlss.GetValue(),
         dlss_available, value ? value : "");
+    // FRITCHII_DLSS_RENDER_SCALE: the patch is applied at boot, before it is known whether DLSS
+    // runs. When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching
+    // 720p or 1080p itself.
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Native &&
+        Settings::AppliedOcarinaRenderScale() && (value == nullptr || std::string_view{value} != "native")) {
+        backend = VideoCommon::OcarinaUpscaleBackend::Fsr;
+    }
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }
     return backend;
+}
+
+VideoCommon::OcarinaOutputSetting OcarinaUpscaleOutput(const Device& device, u64* vram) {
+    // The main heap's size, as the driver reports it (EDEN_NX2_VRAM_LIMIT_MIB lowers it for
+    // small card tests). GetDeviceLocalMemory is the texture cache's capped share, not the card.
+    u64 size = 0;
+    u64 usage = 0;
+    u64 budget = 0;
+    if (!device.MainHeapNumbers(size, usage, budget)) {
+        size = 0;
+    }
+    if (vram != nullptr) {
+        *vram = size;
+    }
+    return VideoCommon::ResolveOcarinaUpscaleOutput(Settings::values.oot_upscale_output.GetValue(),
+                                                    size, VideoCore::SmallCard::Active());
+}
+
+bool OcarinaFsrOutputsGameSize(VideoCommon::OcarinaUpscaleBackend backend) {
+    static const int mode = VideoCommon::OcarinaFsrOutputMode();
+    static const u32 display_height = mode == 2 ? PrimaryDisplayHeight() : 0;
+    const bool game_size = VideoCommon::OcarinaFsrOutputsGameSize(mode, backend, display_height);
+    static std::atomic<bool> logged{false};
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && mode != 0 && !logged.exchange(true)) {
+        LOG_INFO(Render_Vulkan, "Ocarina FSR output (FRITCHII_FSR_OUTPUT={}): {}{}", mode,
+                 game_size ? "the game's 2560x1440 picture, no 4K composite" : "3840x2160",
+                 mode == 2 ? fmt::format(" (primary display {} pixels tall)", display_height)
+                           : std::string{});
+    }
+    return game_size;
 }
 
 } // namespace Vulkan

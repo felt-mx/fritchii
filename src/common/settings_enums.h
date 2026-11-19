@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -147,7 +146,7 @@ ENUM(ConfirmStop, Ask_Always, Ask_Based_On_Game, Ask_Never);
 ENUM(FullscreenMode, Borderless, Exclusive);
 ENUM(NvdecEmulation, Off, Cpu, Gpu);
 ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X, Res3X, Res4X, Res5X, Res6X, Res7X, Res8X);
-ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3);
+ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3, Auto);
 ENUM(AntiAliasing, None, Fxaa, Smaa);
 ENUM(OotAntiAliasing, Game, NoSharpening, Fsr3, Fsr4);
 ENUM(DlssPreset, Default, J, K, L, M);
@@ -165,12 +164,14 @@ ENUM(ExtendedDynamicState, Disabled, EDS1, EDS2, EDS3);
 ENUM(GpuLogLevel, Off, Errors, Standard, Verbose, All)
 ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
-ENUM(FrameGenType, Lsfg, Fsr3);
 ENUM(MeshShaderMode, Automatic, Native, Compute);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
-ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165);
+// New values go at the end: saved configs store the index.
+ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
+// Ocarina of Time's texture LOD bias while DLSS or FSR upscales (Settings oot_texture_sharpness).
+ENUM(OotTextureSharpness, Auto, Sharper, Custom);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

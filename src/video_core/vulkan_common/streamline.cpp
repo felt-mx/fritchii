@@ -550,7 +550,8 @@ bool IsFrameGenAvailable() {
 }
 
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                  u32 graphics_family, u32 optical_flow_family, vk::DeviceDispatch& dld) {
+                  u32 graphics_family, u32 first_queue_index, u32 optical_flow_family,
+                  vk::DeviceDispatch& dld) {
     State& state = GetState();
     if (!WantsDevice()) {
         return false;
@@ -562,15 +563,17 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     info.computeQueueFamily = graphics_family;
     info.graphicsQueueFamily = graphics_family;
     if (state.fg_wanted) {
-        // The device was created with frame generation's queues after the renderer's first
-        // graphics queue (Device::GetDeviceQueueCreateInfos): compute, then graphics, then optical
-        // flow (in its own family, or after those in the graphics family).
-        info.computeQueueIndex = 1;
-        info.graphicsQueueIndex = 1 + state.fg_queues.compute;
+        // The device was created with frame generation's queues from first_queue_index of the
+        // graphics family (Device::GetDeviceQueueCreateInfos, after the renderer's and the side
+        // queue): compute, then graphics, then optical flow (in its own family, or after those
+        // in the graphics family).
+        info.computeQueueIndex = first_queue_index;
+        info.graphicsQueueIndex = first_queue_index + state.fg_queues.compute;
         info.opticalFlowQueueFamily = optical_flow_family;
-        info.opticalFlowQueueIndex = optical_flow_family == graphics_family
-                                         ? 1 + state.fg_queues.compute + state.fg_queues.graphics
-                                         : 0;
+        info.opticalFlowQueueIndex =
+            optical_flow_family == graphics_family
+                ? first_queue_index + state.fg_queues.compute + state.fg_queues.graphics
+                : 0;
         info.useNativeOpticalFlowMode = state.fg_queues.optical_flow != 0;
     }
     if (const sl::Result result = state.api.set_vulkan_info(info); result != sl::Result::eOk) {

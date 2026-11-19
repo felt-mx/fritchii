@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -15,8 +14,10 @@
 #endif
 
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -64,22 +65,6 @@ std::optional<VkSurfaceFormatKHR> ChooseHdrSurfaceFormat(vk::Span<VkSurfaceForma
     return std::nullopt;
 }
 
-bool FrameGenRequested() {
-#ifdef HAS_LSFG
-    return Settings::values.frame_gen.GetValue();
-#else
-    return false;
-#endif
-}
-
-// Whether frame generation needs 8-bit present frames: Lossless Scaling's shaders store rgba8,
-// FSR 3's store any format, so FSR 3 keeps HDR frames where the GPU can store to them.
-bool FrameGenNeedsSdrFrames(bool hdr_frame_storage) {
-    return FrameGenRequested() &&
-           (Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3 ||
-            !hdr_frame_storage);
-}
-
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed) {
 #ifdef EGLANTINE_STREAMLINE
@@ -99,9 +84,6 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
         // Choose Mailbox or Immediate if unlocked and those modes are supported
         const auto mode = Settings::values.vsync_mode.GetValue();
-        if (Settings::FrameGenActive()) {
-            return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
-        }
         if (Settings::SpeedLimitEnabled() &&
             Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
             return mode;
@@ -178,8 +160,6 @@ Swapchain::Swapchain(
     , device{device_}
     , scheduler{scheduler_}
 {
-    const VkFormatProperties props = device.GetPhysical().GetFormatProperties(HdrFrameFormat);
-    hdr_frame_storage = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     Create(surface, width_, height_);
 }
 
@@ -222,9 +202,13 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
-    const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+    VkResult result;
+    {
+        const Common::Nx2Hitch::StallScope stall{"present: vkAcquireNextImageKHR"};
+        result = device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -245,6 +229,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         // No image was acquired, so image_index is stale: the caller recreates and tries again.
         return true;
     }
+    // EDEN_NX2_STALL_SNAPSHOT: between acquire and present from here (Present ends it).
+    Common::Nx2Hitch::StallAcquired();
+    const Common::Nx2Hitch::StallScope image_stall{"present: wait for the image's last tick"};
 
     const auto wait_with_frame_pacing = [this, may_flush] {
     switch (Settings::values.frame_pacing_mode.GetValue()) {
@@ -307,12 +294,18 @@ u64 Swapchain::Present(VkSemaphore render_semaphore) {
     // The renderer's queue is shared with the Vulkan worker; a queue of its own (DLSS Frame
     // Generation) is only used here. DLSS-G's present blocks for a while: under the lock it held
     // the worker's submits and halved the real frame rate.
+    const auto lock_stall = Common::Nx2Hitch::StallEnter("present: wait for the submit lock");
     std::unique_lock lock{scheduler.submit_mutex, std::defer_lock};
     if (!device.HasSwapchainQueue()) {
         lock.lock();
     }
+    Common::Nx2Hitch::StallLeave(lock_stall);
+    const auto present_stall = Common::Nx2Hitch::StallEnter("present: vkQueuePresentKHR");
+    const VkResult present_result = present_queue.Present(present_info);
+    Common::Nx2Hitch::StallLeave(present_stall);
+    Common::Nx2Hitch::StallPresented();
     bool queued = false;
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    switch (const VkResult result = present_result) {
     case VK_SUCCESS:
         queued = true;
         break;
@@ -352,7 +345,6 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     const VkSurfaceFormatKHR previous_format = surface_format;
     hdr_requested = Settings::values.hdr_output.GetValue();
-    frame_gen_sdr_frames = FrameGenNeedsSdrFrames(hdr_frame_storage);
     const std::optional<VkSurfaceFormatKHR> hdr_format =
         hdr_requested ? ChooseHdrSurfaceFormat(formats) : std::nullopt;
     if (hdr_requested && !hdr_format && !hdr_unavailable_logged) {
@@ -377,6 +369,14 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
         LOG_INFO(Render_Vulkan, "DLSS Frame Generation: presenting without VSync (Immediate)");
     }
 #endif
+    // For Ocarina of Time's high refresh rate cap (nx2_gsv.h): only FIFO limits it to the display.
+    VideoCommon::Nx2Perf::g_present_mode.store(
+        static_cast<int>(present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? Settings::VSyncMode::Immediate
+                         : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? Settings::VSyncMode::Mailbox
+                         : present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                             ? Settings::VSyncMode::FifoRelaxed
+                             : Settings::VSyncMode::Fifo),
+        std::memory_order_relaxed);
 
     u32 requested_image_count{capabilities.minImageCount + 1};
     // Ensure Triple buffering if possible.
@@ -467,8 +467,7 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     images = swapchain.GetImages();
     image_count = static_cast<u32>(images.size());
     // Android's SdrFrameFormat is already ordered the same as Switch.
-    image_view_format = output == SwapchainOutput::Sdr || frame_gen_sdr_frames ? SdrFrameFormat
-                                                                                : HdrFrameFormat;
+    image_view_format = output == SwapchainOutput::Sdr ? SdrFrameFormat : HdrFrameFormat;
     ++generation;
     metadata_peak = 0;
     metadata_paper_white = 0;
@@ -525,9 +524,7 @@ bool Swapchain::NeedsPresentModeUpdate() const {
 }
 
 bool Swapchain::NeedsOutputUpdate() const {
-    return hdr_requested != Settings::values.hdr_output.GetValue() ||
-           (output != SwapchainOutput::Sdr &&
-            frame_gen_sdr_frames != FrameGenNeedsSdrFrames(hdr_frame_storage));
+    return hdr_requested != Settings::values.hdr_output.GetValue();
 }
 
 } // namespace Vulkan
