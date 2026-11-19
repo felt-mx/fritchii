@@ -1,9 +1,11 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <functional>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -27,8 +29,19 @@ struct MemoryInfo {
 /// only Windows fills them in).
 /// Commit the system can still hand out, in bytes: its commit limit (RAM plus the page files)
 /// minus what is committed. No value where the host reports no such limit (anything but Windows).
-/// From zortos293/Lichii#1210.
+/// Ported.
 [[nodiscard]] std::optional<u64> GetSystemCommitRoom();
+
+/// FRITCHII_VRAM_BUDGET_MODE=os: the OS's count of dedicated video memory in use on one adapter
+/// (by every process) and this process's part of it.
+struct AdapterVideoMemory {
+    u64 adapter_dedicated{};
+    u64 process_dedicated{};
+};
+/// The last sample (taken once a second on a low priority thread of its own, PDH's GPU Adapter
+/// Memory and GPU Process Memory counters; the first call starts it) for the adapter with this
+/// LUID. No value before the first sample, when it is older than 5 s, and off Windows.
+[[nodiscard]] std::optional<AdapterVideoMemory> GetAdapterVideoMemory(u32 luid_low, s32 luid_high);
 
 struct ProcessMemoryUsage {
     u64 working_set{};
@@ -58,5 +71,44 @@ struct HeapUsage {
 HeapUsage SampleHeapUsage();
 /// The last SampleHeapUsage result (zeros before the first).
 [[nodiscard]] HeapUsage LastHeapUsage();
+
+/// Committed memory of zeros that takes RAM only where it is touched (VirtualAlloc, anonymous
+/// mmap); null on failure. For big tables mostly left zero.
+[[nodiscard]] void* AllocateZeroPages(u64 bytes);
+void FreeZeroPages(void* memory, u64 bytes);
+
+/// FRITCHII_MEM_CENSUS (boot, default 0; docs/fritchii/switches.md): every 30 s, and whenever the
+/// working set climbs 512 MiB past the last census (a load peak), walks this process's address
+/// space (VirtualQuery and one working set query on Windows, /proc/self/smaps on Linux) and logs
+/// committed and resident MiB by owner: tagged ranges (guest memory, VMA's host maps), images
+/// (DLLs, drivers), heaps, stacks, executable private memory (the JIT code caches), and the rest
+/// of the private memory by reservation size with its largest allocations. Read-only.
+/// 1 = committed and resident, 2 = also every heap's summary (locks each heap: can hitch),
+/// 3 = committed only (no working set query).
+namespace MemCensus {
+[[nodiscard]] int Mode();
+/// A named range for the census (`name` must outlive it: a string literal). No-op when off.
+void Tag(const char* name, const void* base, u64 size);
+void Untag(const void* base);
+/// Text the census adds to its log (guest residency, JIT compiles); called on the census thread.
+void SetGuestSampler(std::function<std::string()> sampler);
+/// Sizes of memory some library allocates where the census can't see its address (the driver's
+/// copies of Vulkan device memory): private allocations of the same size (64 KiB granules) are
+/// counted under `label` ("size match"). `label` must be a string literal. Called on the census
+/// thread; null removes it.
+void SetSizeSource(const char* label, std::function<std::vector<u64>()> source);
+/// More text for the census's "more" line from an owner of a big table (`key` is the owner; one
+/// reporter per key). Called on the census thread under a lock that RemoveReporter also takes,
+/// so the owner can remove it in its destructor and the call is never running past that.
+void AddReporter(const void* key, std::function<std::string()> reporter);
+void RemoveReporter(const void* key);
+/// For reporters: which 4 KiB pages of [base, base + bytes) are in the working set (1 per page;
+/// all 1 where the query is not available). Never touches the pages.
+[[nodiscard]] std::vector<u8> ResidentPages(const void* base, u64 bytes);
+/// Starts the census thread when Mode() is not 0 (once per Start/Stop pair).
+void Start();
+/// Stops and joins it (before what the sampler reads goes away).
+void Stop();
+} // namespace MemCensus
 
 } // namespace Common

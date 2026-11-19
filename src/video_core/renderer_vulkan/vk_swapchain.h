@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -192,8 +191,6 @@ private:
     VkSurfaceFormatKHR surface_format{};
     SwapchainOutput output{SwapchainOutput::Sdr};
     bool hdr_requested{};       ///< hdr_output when the swapchain was created
-    bool frame_gen_sdr_frames{}; ///< Frame generation needed 8-bit frames at creation
-    bool hdr_frame_storage{};    ///< FSR 3 frame generation can store to HdrFrameFormat frames
     bool hdr_unavailable_logged{};
     u64 generation{};
     u32 metadata_peak{};        ///< Luminance last sent with vkSetHdrMetadataEXT

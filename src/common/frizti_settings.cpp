@@ -10,6 +10,7 @@ constexpr std::string_view RevisionKey = "revision";
 constexpr std::string_view GlobalPrefix = "global.";
 constexpr std::string_view PerGamePrefix = "game.";
 constexpr std::string_view UseGlobal = "global";
+constexpr std::string_view FoldedKey = "oot_folded";
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
@@ -22,29 +23,29 @@ std::string_view Trim(std::string_view text) {
 }
 } // namespace
 
-std::vector<BasicSetting*> TunedSettings(Values& vals) {
+std::vector<BasicSetting*> TunedSettings(Values& values) {
     // One line per setting; bump Revision when this list or a default here changes.
     return {
-        &vals.gpu_accuracy,             // Low
-        &vals.dma_accuracy,             // Default
-        &vals.gpu_fence_behavior,       // Default
-        &vals.vsync_mode,               // Mailbox: the host frame pacer times presents
-        &vals.async_presentation,       // On: the host frame pacer runs on the present thread
-        &vals.use_asynchronous_shaders, // On: unbuilt pipelines skip draws, no freeze
-        &vals.use_docked_mode,          // Docked
-        &vals.memory_layout_mode,       // 8 GB: Ocarina's own memory size
-        &vals.nvdec_emulation,          // GPU: Ocarina's cutscene videos
-        &vals.scaling_filter,           // ScaleForce (newer Lichii builds seed FSR)
-        &vals.resolution_setup,         // 1x: a higher scale left over from other games costs fps
-        &vals.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
-        &vals.cpu_accuracy,             // Auto
-        &vals.use_disk_shader_cache,    // On: no shader rebuild every boot
-        &vals.use_vulkan_driver_pipeline_cache, // On
+        &values.gpu_accuracy,             // Low
+        &values.dma_accuracy,             // Default
+        &values.gpu_fence_behavior,       // Default
+        &values.vsync_mode,               // Mailbox: the host frame pacer times presents
+        &values.async_presentation,       // On: the host frame pacer runs on the present thread
+        &values.use_asynchronous_shaders, // On: unbuilt pipelines skip draws, no freeze
+        &values.use_docked_mode,          // Docked
+        &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
+        &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
+        &values.scaling_filter,           // Auto: Area above the window size, else ScaleForce
+        &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
+        &values.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
+        &values.cpu_accuracy,             // Auto
+        &values.use_disk_shader_cache,    // On: no shader rebuild every boot
+        &values.use_vulkan_driver_pipeline_cache, // On
         // EDS2 and dynamic vertex input: the precompiled OoT recipe is recorded with them, and
         // players who turned them off (an old AMD crash tip; the crash was shader libraries) had
         // every graphics pipeline skipped as "for another device" (2026-11-09, RX 9070 XT log).
-        &vals.dyna_state,                 // EDS2
-        &vals.vertex_input_dynamic_state, // On
+        &values.dyna_state,                 // EDS2
+        &values.vertex_input_dynamic_state, // On
     };
 }
 
@@ -52,6 +53,9 @@ std::string SerializeRecord(const Record& record) {
     std::string text = "# Written by the Frizti builds: the tuned settings as they last saved "
                        "them. Other builds share qt-config.ini but not this file.\n";
     text += fmt::format("{}={}\n", RevisionKey, record.revision);
+    if (record.oot_folded) {
+        text += fmt::format("{}=1\n", FoldedKey);
+    }
     for (const auto& [label, value] : record.global) {
         text += fmt::format("{}{}={}\n", GlobalPrefix, label, value);
     }
@@ -79,6 +83,8 @@ Record ParseRecord(std::string_view text) {
             } catch (...) {
                 record.revision = 0;
             }
+        } else if (key == FoldedKey) {
+            record.oot_folded = value == "1";
         } else if (key.starts_with(GlobalPrefix)) {
             record.global.insert_or_assign(std::string{key.substr(GlobalPrefix.size())}, value);
         } else if (key.starts_with(PerGamePrefix)) {
@@ -133,9 +139,50 @@ std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, co
     return changes;
 }
 
-std::vector<Change> FixDockedController(Values& vals) {
-    auto& player = vals.players.GetValue(true)[0];
-    if (vals.use_docked_mode.GetValue(true) != ConsoleMode::Docked ||
+std::vector<Moved> FoldPerGame(std::span<BasicSetting* const> settings) {
+    std::vector<Moved> moved;
+    for (BasicSetting* const setting : settings) {
+        if (!setting->Switchable() || !setting->Save() || setting->UsingGlobal()) {
+            continue;
+        }
+        const std::string value = setting->ToString();
+        setting->SetGlobal(true);
+        if (setting->ToString() == value) {
+            continue; // the override matched the main value
+        }
+        const std::string from = setting->Canonicalize();
+        setting->LoadString(value);
+        moved.push_back({setting, from, setting->Canonicalize()});
+    }
+    return moved;
+}
+
+std::vector<Change> FoldPerGamePlayers(Values& values) {
+    std::vector<Change> changes;
+    const bool was_global = values.players.UsingGlobal();
+    values.players.SetGlobal(false);
+    auto& custom = values.players.GetValue();
+    auto& global = values.players.GetValue(true);
+    for (size_t index = 0; index < custom.size(); ++index) {
+        if (custom[index].profile_name.empty()) {
+            continue; // this player already uses the main controls
+        }
+        const std::string from = global[index].profile_name;
+        global[index] = custom[index];
+        custom[index].profile_name.clear();
+        if (from != global[index].profile_name) {
+            changes.push_back({fmt::format("player_{}_profile", index),
+                               from.empty() ? std::string{"own"} : from,
+                               global[index].profile_name});
+        }
+    }
+    values.players.SetGlobal(was_global);
+    return changes;
+}
+
+std::vector<Change> FixDockedController(Values& values) {
+    auto& player = values.players.GetValue(true)[0];
+    if (values.use_docked_mode.GetValue(true) != ConsoleMode::Docked ||
         player.controller_type != ControllerType::Handheld) {
         return {};
     }
@@ -144,20 +191,20 @@ std::vector<Change> FixDockedController(Values& vals) {
 }
 
 std::map<std::string, std::string> GlobalValues(std::span<BasicSetting* const> settings) {
-    std::map<std::string, std::string> result;
+    std::map<std::string, std::string> values;
     for (const BasicSetting* const setting : settings) {
-        result.emplace(setting->GetLabel(), setting->ToStringGlobal());
+        values.emplace(setting->GetLabel(), setting->ToStringGlobal());
     }
-    return result;
+    return values;
 }
 
 std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> settings) {
-    std::map<std::string, std::string> result;
+    std::map<std::string, std::string> values;
     for (const BasicSetting* const setting : settings) {
-        result.emplace(setting->GetLabel(),
+        values.emplace(setting->GetLabel(),
                        setting->UsingGlobal() ? std::string{UseGlobal} : setting->ToString());
     }
-    return result;
+    return values;
 }
 
 std::string FormatChanges(std::span<const Change> changes) {

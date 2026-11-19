@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -38,19 +37,14 @@ struct Frame {
     u32 index;
     vk::Image image;
     vk::ImageView image_view;
-    vk::ImageView storage_view;
     vk::Framebuffer framebuffer;
     vk::CommandBuffer cmdbuf;
     vk::Semaphore render_ready;
     vk::Fence present_done;
     VkFormat format{};  ///< Of image and image_view
     bool pq_content{};  ///< Holds a game's HDR10 (BT.2020 PQ) output rather than SDR colour
-    bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
-    /// Time the present thread leaves before presenting the next frame. Frame generation sets it
-    /// on generated frames, so they share the screen time evenly with the real ones.
-    std::chrono::nanoseconds present_spacing{};
     void* frame_gen_token{}; ///< DLSS Frame Generation: the frame's Streamline token, if any
     /// Where the game image is in the frame (and the swapchain image), for DLSS Frame Generation.
     u32 game_left{}, game_top{}, game_right{}, game_bottom{};
@@ -75,38 +69,26 @@ public:
 
     /// Recreates the present frame to match the provided parameters
     void RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
-                       VkRenderPass rd, bool storage);
-
-    [[nodiscard]] bool NeedsStorage(const Frame* frame, bool required) const;
+                       VkRenderPass rd);
 
     /// Waits for the present thread to finish presenting all queued frames.
     void WaitPresent();
 
-    /// How many additional frames can be queued without stalling the render thread
-    [[nodiscard]] size_t MaxExtraFrames() const;
-
     [[nodiscard]] std::size_t SwapchainImageCount() const { return swapchain_image_count; }
-    [[nodiscard]] VkFormat SwapchainImageFormat() const { return swapchain_image_format; }
     /// Format to render present frames in for the current swapchain.
     [[nodiscard]] VkFormat FrameFormat() const { return frame_format; }
-    /// Image format of `frame`: SdrFrameFormat frames use the SDR swapchain's format.
-    [[nodiscard]] VkFormat FrameImageFormat(const Frame& frame) const;
 
 private:
-    /// Whether frame generation can store to frames of this view format.
-    [[nodiscard]] bool CanStore(const Frame* frame, VkFormat view_format) const;
-
-    void StartPresentThread();
-
     void PresentThread(std::stop_token token);
 
-    /// With EDEN_DKB_FRAME_TRACE=1 and frame generation on, logs the presents of every 10 s.
-    void LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
-                   std::chrono::steady_clock::time_point now);
-
     /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
-    /// `frame` until its target. Returns whether it was held.
+    /// `frame` until its target (FRITCHII_PACE_FIX 2: leaves the hold to CopyToSwapchainImpl).
+    /// Returns whether it was held.
     bool PaceFrame(Frame* frame, std::stop_token token);
+
+    /// Without present wait (no pacing): still reads the display's refresh rate now and then,
+    /// for Ocarina of Time's "Monitor refresh rate" cap (it fell back to 60 Hz).
+    void NoteDisplayRefresh();
 
     /// Waits for each present id until it is shown (VK_KHR_present_wait).
     void PresentWaitThread(std::stop_token token);
@@ -144,8 +126,6 @@ private:
     std::mutex free_mutex;
     std::jthread present_thread;
     bool blit_supported;
-    bool storage_supported;
-    bool hdr_storage_supported; ///< To HdrFrameFormat frames, for FSR 3 frame generation
     bool use_present_thread;
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
@@ -153,15 +133,6 @@ private:
     std::atomic<VkFormat> frame_format{};
     std::atomic<VkFormat> sdr_frame_image_format{}; ///< Image format of SdrFrameFormat frames
     std::optional<HdrOutputPass> hdr_output;        ///< Present thread only
-    /// The present thread presents no frame before this (Frame::present_spacing).
-    std::chrono::steady_clock::time_point next_present{};
-    struct {
-        std::chrono::steady_clock::time_point since{};
-        u64 real{};
-        u64 generated{};
-        std::chrono::nanoseconds spacing{};
-        std::chrono::steady_clock::duration present_time{};
-    } pacing_log;
 
     // Host frame pacer, used when the device supports VK_KHR_present_wait (present thread only).
     struct PendingWait {
@@ -176,6 +147,12 @@ private:
     };
     bool present_wait_enabled{};
     HostPacer pacer;
+    /// FRITCHII_PACE_FIX 2: PaceFrame's hold, taken in CopyToSwapchainImpl before the present.
+    struct DeferredHold {
+        std::chrono::steady_clock::time_point start;
+        std::chrono::steady_clock::time_point target;
+    };
+    std::optional<DeferredHold> deferred_hold;
     u64 last_present_id{};
     std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
     std::mutex wait_queue_mutex;

@@ -22,10 +22,8 @@ on an HDR display. Two settings go with it: `hdr_peak_luminance` (1000 nits) and
    word 6 = 4). Those presents get `FramebufferConfig::pq_encoded`, and the present frame that
    shows them `Frame::pq_content`. RGBA8 images, and RGB10A2 from a game never told HDR, are
    SDR.
-4. **Present.** On an HDR swapchain, present frames are `A2B10G10R10` (`HdrFrameFormat`), or
-   `SdrFrameFormat` while Lossless Scaling frame generation runs (its shaders store `rgba8`).
-   FSR 3 frame generation writes any format, so it keeps `HdrFrameFormat` frames where the GPU
-   can store to them. Instead of the blit,
+4. **Present.** On an HDR swapchain, present frames are `A2B10G10R10` (`HdrFrameFormat`).
+   Instead of the blit,
    `HdrOutputPass` draws the frame into the swapchain image with `vulkan_present_hdr.frag`:
    - HDR10 frame to HDR10 swapchain: copied unchanged.
    - SDR frame to HDR10: gamma 2.2 to linear, times paper white, BT.709 to BT.2020, PQ.
@@ -50,12 +48,11 @@ Screenshots and `EDEN_NX2_FRAME_CAPTURE` of HDR10 content are tone mapped to SDR
 
 - FXAA, SMAA, FSR and SGSR run on the PQ values of HDR10 content; their intermediates may be
   8-bit.
-- Lossless Scaling frame generation keeps 8-bit present frames, so HDR10 content can band with
-  it on; FSR 3 frame generation doesn't, unless the GPU can't store to `A2B10G10R10` images.
-- Ocarina of Time's 4K DLSS presentation lays DLSS's detail over the game's HDR10 output
+- Ocarina of Time's upscaled DLSS/FSR presentation (4K, or the output picked in
+  `oot_upscale_output`) lays the upscaler's detail over the game's HDR10 output
   (`ocarina_dlss_4k_composite_hdr.comp`), comparing the two in scene units by their local
   brightness ratio. Where they differ (HUD, effects, scene colour above SDR white) the game's 1440p
-  output is shown. The log names the shader that drew the HDR10 output, or why the 4K
+  output is shown. The log names the shader that drew the HDR10 output, or why the upscaled
   presentation was skipped. Not yet checked on an HDR display.
 - Only the Vulkan renderer outputs HDR. OpenGL keeps reporting SDR to games.
 - Which images hold HDR10 is inferred from vi2 104 and the RGB10A2 format code; no title has

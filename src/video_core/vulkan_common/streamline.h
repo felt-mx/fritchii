@@ -72,7 +72,8 @@ void DropFrameGen(const char* reason);
 /// Streamline's manual hooking needs. Stops Streamline and returns false when DLSS can't run.
 /// optical_flow_family is the family the optical flow queues were created in (frame generation).
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                  u32 graphics_family, u32 optical_flow_family, vk::DeviceDispatch& dld);
+                  u32 graphics_family, u32 first_queue_index, u32 optical_flow_family,
+                  vk::DeviceDispatch& dld);
 
 /// A device queue fetched through Streamline's vkGetDeviceQueue, so DLSS-G accepts presents on
 /// it ("Invalid VK app queue - not created by the application" otherwise). Null without it.

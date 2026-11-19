@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -51,7 +50,7 @@ struct ResolutionScalingInfo {
 
 #ifndef CANNOT_EXPLICITLY_INSTANTIATE
 // Instantiate the classes elsewhere (settings.cpp) to reduce compiler/linker work
-// TODO(crueter): Move new enums here
+// TODO: Move new enums here
 #define SETTING(TYPE, RANGED) extern template class Setting<TYPE, RANGED>
 #define SWITCHABLE(TYPE, RANGED) extern template class SwitchableSetting<TYPE, RANGED>
 
@@ -65,6 +64,8 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotTextureSharpness, false);
+SWITCHABLE(float, true);
 SWITCHABLE(DlssPreset, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(OotRefreshCap, false);
@@ -352,6 +353,10 @@ struct Values {
 #endif
         "backend", Category::Renderer};
     SwitchableSetting<u32> vulkan_device{linkage, 0, "vulkan_device", Category::Renderer, Specialization::RuntimeList};
+    // The picked card's name, saved with its index: a changed device order finds it again by
+    // name, and empty means no choice yet (Vulkan::PickPhysicalDevice).
+    SwitchableSetting<std::string> vulkan_device_name{linkage, std::string(), "vulkan_device_name",
+                                                      Category::Renderer};
 
     // Graphics Settings
     ResolutionScalingInfo resolution_info{};
@@ -368,7 +373,7 @@ struct Values {
                                                   true};
 
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
-                                                    ScalingFilter::ScaleForce,
+                                                    ScalingFilter::Auto,
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
@@ -407,7 +412,7 @@ struct Values {
                                            Specialization::Default,
                                            true,
                                            true};
-    // The DLSS mode (zortos293/Lichii#1249): Automatic picks it from the game's render and output
+    // The DLSS mode: Automatic picks it from the game's render and output
     // sizes as before; an explicit mode applies when the render size fits NVIDIA's range for it.
     // Native (DLAA) keeps the game's render size. Applies live too.
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
@@ -441,6 +446,9 @@ struct Values {
                                                   true,
                                                   true,
                                                   &nvidia_dlss_frame_gen};
+    // OoT: DLSS gets the camera jitter it is made for (and the texture bias that goes with it).
+    // On by default; EDEN_NX2_DLSS_JITTER still overrides it. Takes effect when the game starts.
+    SwitchableSetting<bool> oot_dlss_jitter{linkage, true, "oot_dlss_jitter", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -463,6 +471,19 @@ struct Values {
     // when on, still replaces Game and No sharpening; an FSR choice wins over it.
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
+    // OoT's texture LOD bias while DLSS or FSR upscales (VideoCommon::OcarinaTextureLodBias).
+    // Auto: from the render and output sizes (NVIDIA's log2(render / output) for DLSS with its
+    // jitter, AMD's log2(render / output) - 1 for FSR). Sharper: 0.5 lower. Custom: the value
+    // below as is. Takes effect when the game starts.
+    SwitchableSetting<OotTextureSharpness> oot_texture_sharpness{
+        linkage, OotTextureSharpness::Auto, "oot_texture_sharpness", Category::Renderer};
+    SwitchableSetting<float, true> oot_lod_bias_custom{linkage, -1.58f, -3.0f, 1.0f,
+                                                       "oot_lod_bias_custom", Category::Renderer};
+    // OoT's DLSS or FSR output height (docked), set by the picture menu: 0 = Auto (4K with Max
+    // Resolution, 1440p without, as before), else 1080, 1440, 1800, 2160, 2880 or 4320
+    // (VideoCommon::OcarinaUpscaleOutputs; above 4K only where the card's memory allows it).
+    // Global only; takes effect when the game starts.
+    Setting<u32> oot_upscale_output{linkage, 0, "oot_upscale_output", Category::Renderer};
     // The title screen's and cutscenes' videos (AV1 1080p60): the game's own upscaler (removes
     // banding, 1080p -> 1440p; tensor operations) or a bilinear copy. Automatic: the game's where
     // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices
@@ -493,75 +514,6 @@ struct Values {
                                                 Specialization::Default,
                                                 true,
                                                 true};
-
-    SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
-                                      Specialization::Default, true, false};
-
-    SwitchableSetting<FrameGenType> frame_gen_type{linkage,
-                                                   FrameGenType::Fsr3,
-                                                   "frame_gen_type",
-                                                   Category::Renderer,
-                                                   Specialization::Default,
-                                                   true,
-                                                   false,
-                                                   &frame_gen};
-
-    SwitchableSetting<u32, true> frame_gen_multiplier{linkage,
-                                                      2,
-                                                      2,
-                                                      4,
-                                                      "frame_gen_multiplier",
-                                                      Category::Renderer,
-                                                      Specialization::Countable,
-                                                      true,
-                                                      false,
-                                                      &frame_gen};
-
-    SwitchableSetting<u32, true> frame_gen_target_rate{linkage,
-                                                       0,
-                                                       0,
-                                                       240,
-                                                       "frame_gen_target_rate",
-                                                       Category::Renderer,
-                                                       Specialization::Countable,
-                                                       true,
-                                                       true,
-                                                       &frame_gen};
-
-    SwitchableSetting<bool> frame_gen_flow_scale_auto{linkage,
-                                                      true,
-                                                      "frame_gen_flow_scale_auto",
-                                                      Category::Renderer,
-                                                      Specialization::Default,
-                                                      true,
-                                                      false,
-                                                      &frame_gen};
-
-    SwitchableSetting<u32, true> frame_gen_flow_scale{linkage,
-                                                      75,
-                                                      25,
-                                                      100,
-                                                      "frame_gen_flow_scale",
-                                                      Category::Renderer,
-                                                      Specialization::Countable |
-                                                          Specialization::Percentage,
-                                                      true,
-                                                      true,
-                                                      &frame_gen};
-
-    SwitchableSetting<u32, true> frame_gen_queue_target{linkage,
-                                                        0,
-                                                        0,
-                                                        2,
-                                                        "frame_gen_queue_target",
-                                                        Category::Renderer,
-                                                        Specialization::Countable,
-                                                        true,
-                                                        false,
-                                                        &frame_gen};
-
-    SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
-                                                Category::Renderer};
 
     // HDR output (Vulkan): an HDR10 (or scRGB) swapchain when the display offers one; Switch 2
     // games are then told their display shows HDR with this peak and paper white.
@@ -1113,6 +1065,10 @@ struct Values {
 
     // Add-Ons
     std::map<u64, std::vector<std::string>> disabled_addons;
+    // Add-on names Fritchii has seen per title (config [SeenAddOns]). While tracking, a mod not
+    // in here is new and starts disabled (FileSys::PatchManager); a seen one keeps its state.
+    std::map<u64, std::vector<std::string>> seen_addons;
+    bool seen_addons_tracking = false;
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
@@ -1129,13 +1085,25 @@ struct NvidiaDlssRuntimeSettings {
 void RefreshNvidiaDlssRuntimeSettings();
 NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 
-constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
-constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
+/// FRITCHII_DLSS_RENDER_SCALE (boot, 0 = off): Ocarina of Time's own render resolution follows
+/// the NVIDIA DLSS quality (a built-in patch of its fixed render scale under Max Resolution), so
+/// Performance renders 1920x1080 and Ultra Performance 1280x720 before DLSS makes 4K. Off, every
+/// quality but Native takes the game's 2560x1440.
+[[nodiscard]] bool OcarinaDlssRenderScaleSwitch();
+/// The quality whose render scale the patch applies when the game starts: Performance or Ultra
+/// Performance, with the switch on, NVIDIA DLSS on, docked and no FSR choice for OoT.
+[[nodiscard]] std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
+/// The quality whose render-scale patch the running game's main module got (none: unpatched).
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
+[[nodiscard]] std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
+/// OoT's render height at a quality with the patch (2560x1440 scaled by 1, 0.75 or 0.5).
+[[nodiscard]] u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale);
+/// Whether OoT's built-in Max Resolution patch will apply at the next start (as PatchNSO decides
+/// it: EDEN_NX2_NO_MAX_RES=1 skips it, =0 forces it, else it is off when disabled in Add-Ons).
+/// With it, docked OoT renders a fixed 2560x1440; without it the game's dynamic resolution
+/// (1920x1080 at most in the owner's logs, upscaled to 1440p by its 3/4 pass).
+[[nodiscard]] bool OcarinaMaxResolutionOn();
 
-/// Whether frame generation runs: the setting, and never in Fritchii builds, which hide its
-/// settings (a value left on by an older build made the camera flicker, 2026-11-09).
-[[nodiscard]] bool FrameGenActive();
-[[nodiscard]] u32 FrameGenMultiplier();
 /// Whether emulation runs at the speed limit: use_speed_limit, and in Fritchii always for Ocarina
 /// of Time, whose logic speeds up with the frame rate ("Unlocked" made the game run fast). Not
 /// while Ocarina runs with its high refresh rate patch outside the 30 FPS mode: its step follows
@@ -1146,10 +1114,6 @@ constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
 /// game runs (Ctrl+U, FileSys::SwitchOotHighRefreshLive) sets it too.
 void SetOotHighRefreshPatched(bool patched);
 [[nodiscard]] bool OotHighRefreshPatched();
-
-[[nodiscard]] size_t FrameGenGenerations();
-
-[[nodiscard]] size_t FrameGenMaxGenerations();
 
 bool GetDebugKnobAt(u8 i);
 
@@ -1164,6 +1128,10 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
+/// The CPU accuracy the JIT uses: FRITCHII_CPU_ACCURACY (boot env, a test's sizing run: auto,
+/// accurate, unsafe, paranoid, debugging) when set, else cpu_accuracy. The stored setting is
+/// never changed, so nothing of the override can be saved to a config.
+CpuAccuracy EffectiveCpuAccuracy();
 void SetNceEnabled(bool is_64bit);
 bool IsNceEnabled();
 
