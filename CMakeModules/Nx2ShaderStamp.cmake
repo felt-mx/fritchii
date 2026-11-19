@@ -22,6 +22,10 @@
 #   hashes: any later edit to these files leaves it, and the build stops again until someone
 #   checks that edit too.
 
+# cmake -P sets no policies: without this, a CMake 3.x (the GitHub Windows runner's) reads TRUE in
+# while(TRUE) as an unset variable, skips the loop and hashes the skip blocks too.
+cmake_policy(SET CMP0012 NEW)
+
 set(SkipBlocksIn "vk_graphics_pipeline.h;vk_compute_pipeline.h")
 # v6.1, kept by 6.2: Windows (CRLF checkout), Linux (LF checkout).
 set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
