@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <span>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -258,8 +259,9 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Reports a device loss and ends the process. It never returns: the first thread to get here
+    /// writes the report, any other waits for the end.
+    void ReportLoss(std::source_location where = std::source_location::current()) const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -372,6 +374,25 @@ public:
     /// Graphics family index of DLSS Frame Generation's first queue: after the renderer's queue
     /// and the side queue, when there is one.
     u32 FirstFrameGenQueueIndex() const;
+
+    /// FRITCHII_SIM_LINK_HOG: the queue family the copy load gets. Decided once, before the
+    /// device is made.
+    [[nodiscard]] std::optional<u32> LinkHogFamily() const;
+
+    /// FRITCHII_SIM_LINK_HOG (boot, test): a queue of a transfer family for the copy load.
+    vk::Queue GetLinkHogQueue() const {
+        return link_hog_queue;
+    }
+    bool HasLinkHogQueue() const {
+        return has_link_hog_queue;
+    }
+    u32 GetLinkHogFamily() const {
+        return link_hog_family;
+    }
+
+    /// FRITCHII_DESCRIPTOR_SETS (boot): draws and dispatches take descriptor sets from pools
+    /// instead of push descriptors or the descriptor buffer ring. Decided once.
+    [[nodiscard]] bool PrefersDescriptorSets() const;
 
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
@@ -496,6 +517,11 @@ public:
     /// Returns storage alignment requirement.
     VkDeviceSize GetStorageBufferAlignment() const {
         return properties.properties.limits.minStorageBufferOffsetAlignment;
+    }
+
+    /// Returns how many samplers may exist at once.
+    u32 GetMaxSamplerAllocationCount() const {
+        return properties.properties.limits.maxSamplerAllocationCount;
     }
 
     /// Returns the maximum range for storage buffers.
@@ -713,6 +739,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports buffer device address.
     bool IsBufferDeviceAddressSupported() const {
         return extensions.buffer_device_address;
+    }
+
+    /// FRITCHII_OCCL_FLAG: the buffer device address feature is enabled for the flag pipelines
+    /// alone (IsBufferDeviceAddressSupported stays false for everything else).
+    bool IsOcclFlagDeviceAddressEnabled() const {
+        return occl_flag_device_address || extensions.buffer_device_address;
     }
 
     /// Returns true if formatless image load is supported.
@@ -1526,6 +1558,9 @@ private:
     bool has_swapchain_queue{};
     vk::Queue side_queue;        ///< FRITCHII_READ_SIDE_COPY >= 2: graphics family, index 1.
     bool has_side_queue{};
+    vk::Queue link_hog_queue;    ///< FRITCHII_SIM_LINK_HOG: a transfer family's queue.
+    bool has_link_hog_queue{};
+    u32 link_hog_family{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
@@ -1606,6 +1641,8 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    /// FRITCHII_VA_REPORT=1: VK_EXT_device_address_binding_report (vulkan_debug_callback.h).
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1650,6 +1687,7 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+    bool occl_flag_device_address{}; ///< FRITCHII_OCCL_FLAG kept the BDA feature
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_optical_flow{}; ///< DLSS Frame Generation needs the optical flow feature.
     bool streamline_attached{};   ///< Streamline has this device.
