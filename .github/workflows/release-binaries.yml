@@ -376,7 +376,8 @@ jobs:
         shell: bash
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
-          cmake --build build/release --target yuzu yuzu-cmd --parallel -- -k 0
+          # Fritchii v6 removed the CLI frontend (yuzu-cmd / eden-cli); yuzu also builds lichii.exe.
+          cmake --build build/release --target yuzu --parallel -- -k 0
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
       - name: Stop sccache on Windows
@@ -454,7 +455,7 @@ jobs:
         shell: pwsh
         run: |
           # Fritchii v6+: the app is fritchii.exe; lichii.exe is a small launcher without Qt.
-          foreach ($exe in 'fritchii.exe', 'lichii.exe', 'eden-cli.exe') {
+          foreach ($exe in 'fritchii.exe', 'lichii.exe') {
             if (-not (Test-Path "build/release/bin/$exe")) {
               throw "build/release/bin/$exe was not produced"
             }
@@ -629,7 +630,7 @@ jobs:
 
           ## Windows
 
-          Windows packages are in-place zip files: extract and run \`fritchii.exe\` (\`lichii.exe\` starts it too), or \`eden-cli.exe\` from a terminal.
+          Windows packages are in-place zip files: extract and run \`fritchii.exe\` (\`lichii.exe\` starts it too).
 
           | Build Type | Standard | PGO (Recommended) | Notes |
           | --- | --- | --- | --- |
