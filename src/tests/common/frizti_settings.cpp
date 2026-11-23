@@ -32,7 +32,7 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
     CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
-    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
+    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Fsr);
 }
 } // namespace
 
@@ -70,9 +70,9 @@ TEST_CASE("Between revisions only another build's changes are undone", "[frizti_
     REQUIRE(changes.size() == 2);
     CHECK(values->gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
     CHECK(values->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
-    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
+    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::Fsr);
     CHECK(Frizti::FormatChanges(changes) ==
-          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> Auto");
+          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> Fsr");
 }
 
 TEST_CASE("Ocarina's per-game overrides go back to global", "[frizti_settings]") {
@@ -132,6 +132,14 @@ TEST_CASE("The Frizti record round-trips", "[frizti_settings]") {
     CHECK_FALSE(parsed.oot_folded);
     record.oot_folded = true;
     CHECK(Frizti::ParseRecord(Frizti::SerializeRecord(record)).oot_folded);
+    CHECK(parsed.hw_card.empty());
+    CHECK(parsed.hw.empty());
+    record.hw_card = "AMD Radeon RX 9070 XT";
+    record.hw = {{"occlusion_speedup", "2"}};
+    const auto with_hw = Frizti::ParseRecord(Frizti::SerializeRecord(record));
+    CHECK(with_hw.hw_card == record.hw_card);
+    CHECK(with_hw.hw == record.hw);
+    CHECK(with_hw.global == record.global);
 
     const auto empty = Frizti::ParseRecord("");
     CHECK(empty.revision == 0);

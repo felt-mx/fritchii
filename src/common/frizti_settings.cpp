@@ -12,6 +12,8 @@ constexpr std::string_view GlobalPrefix = "global.";
 constexpr std::string_view PerGamePrefix = "game.";
 constexpr std::string_view UseGlobal = "global";
 constexpr std::string_view FoldedKey = "oot_folded";
+constexpr std::string_view HwCardKey = "hw_card";
+constexpr std::string_view HwPrefix = "hw.";
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
@@ -36,7 +38,7 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.use_docked_mode,          // Docked
         &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
         &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
-        &values.scaling_filter,           // Auto: Area above the window size, else ScaleForce
+        &values.scaling_filter,           // FSR 1 (v6.5; Auto before: Area above the window size, else ScaleForce)
         &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
         &values.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
         &values.cpu_accuracy,             // Auto
@@ -62,6 +64,12 @@ std::string SerializeRecord(const Record& record) {
     }
     for (const auto& [label, value] : record.per_game) {
         text += fmt::format("{}{}={}\n", PerGamePrefix, label, value);
+    }
+    if (!record.hw_card.empty()) {
+        text += fmt::format("{}={}\n", HwCardKey, record.hw_card);
+    }
+    for (const auto& [label, value] : record.hw) {
+        text += fmt::format("{}{}={}\n", HwPrefix, label, value);
     }
     return text;
 }
@@ -90,6 +98,10 @@ Record ParseRecord(std::string_view text) {
             record.global.insert_or_assign(std::string{key.substr(GlobalPrefix.size())}, value);
         } else if (key.starts_with(PerGamePrefix)) {
             record.per_game.insert_or_assign(std::string{key.substr(PerGamePrefix.size())}, value);
+        } else if (key == HwCardKey) {
+            record.hw_card = value;
+        } else if (key.starts_with(HwPrefix)) {
+            record.hw.insert_or_assign(std::string{key.substr(HwPrefix.size())}, value);
         }
     }
     return record;
